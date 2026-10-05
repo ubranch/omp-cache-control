@@ -1,22 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="304" viewBox="0 0 1200 304" role="img" aria-labelledby="title desc">
-  <title id="title">A real prefix, maintained outside chat history</title>
-  <desc id="desc">Capture a successful real request. Refresh the eligible prefix only while the native TUI is idle, using a separate bounded request. Resume normal foreground tool work. Provider retention remains outside the extension's control.</desc>
-  <rect width="1200" height="304" rx="24" fill="#0B1118"/>
-  <g id="lifecycle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif">
-    <text x="64" y="72" fill="#F4F7FA" font-size="48" font-weight="600" letter-spacing="-1">Real prefix. Separate maintenance.</text>
-    <text x="64" y="132" fill="#F4F7FA" font-size="26" font-weight="600">Capture real request</text>
-    <text x="464" y="132" fill="#F4F7FA" font-size="26" font-weight="600">Refresh while idle</text>
-    <text x="880" y="132" fill="#F4F7FA" font-size="26" font-weight="600">Resume work</text>
-    <text x="64" y="168" fill="#9AA9BA" font-size="22">Successful matching reply</text>
-    <text x="464" y="168" fill="#F0B879" font-size="22">Paid, bounded, isolated</text>
-    <text x="880" y="168" fill="#9AA9BA" font-size="22">Real tools, real usage</text>
-    <text x="64" y="266" fill="#F4F7FA" font-size="22">No warm turns in history. No guarantee of provider retention.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="344" viewBox="0 0 1200 344"
+     role="img" aria-labelledby="title desc">
+  <title id="title">one prefix. separate maintenance.</title>
+  <desc id="desc">A successful matching foreground reply authorizes capture of the real provider payload. While the native TUI is idle, refresh the eligible prefix with a paid, bounded, isolated request, or renew a verified explicit Google cache lease. Real foreground work cancels maintenance. Warm replies do not become chat-history turns or extend the foreground response chain. Provider retention is not guaranteed.</desc>
+
+  <rect width="1200" height="344" rx="24" fill="#0A0A0A"/>
+  <rect x="0.5" y="0.5" width="1199" height="343" rx="24" fill="none" stroke="#1C1C1F"/>
+
+  <g id="title-block">
+    <text x="72" y="54" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+          font-size="20" letter-spacing="4" fill="#F97316">CACHE LIFECYCLE</text>
+    <text x="68" y="118" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Inter,sans-serif"
+          font-size="52" font-weight="800" letter-spacing="-1.5" fill="#FAFAFA">one prefix. separate maintenance.</text>
   </g>
+
+  <g id="lifecycle">
+    <rect x="64" y="148" width="1072" height="150" rx="14" fill="#111113" stroke="#1C1C1F"/>
+    <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Inter,sans-serif" font-size="26" font-weight="600" fill="#E4E4E7">
+      <text x="88" y="194">capture real request</text>
+      <text x="452" y="194">refresh while idle</text>
+      <text x="816" y="194">resume real work</text>
+    </g>
+    <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="20" fill="#A1A1AA">
+      <text x="88" y="228">successful matching reply</text>
+      <text x="452" y="228">paid · bounded · isolated</text>
+      <text x="816" y="228">cancel active maintenance</text>
+    </g>
+    <line x1="420" y1="172" x2="420" y2="240" stroke="#27272A"/>
+    <line x1="784" y1="172" x2="784" y2="240" stroke="#27272A"/>
+  </g>
+
   <g id="prefix-continuity">
-    <path d="M64 212H1136" stroke="#83E7C3" stroke-width="6" stroke-linecap="round"/>
-    <circle cx="72" cy="212" r="8" fill="#83E7C3"/>
-    <circle cx="472" cy="212" r="9" fill="#F0B879" stroke="#0B1118" stroke-width="3"/>
-    <circle cx="888" cy="212" r="8" fill="#83E7C3"/>
-    <path d="M1124 202L1136 212L1124 222" fill="none" stroke="#83E7C3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M88 268H1112" fill="none" stroke="#52525B" stroke-width="2"/>
+    <circle cx="100" cy="268" r="6" fill="#A1A1AA"/>
+    <circle cx="464" cy="268" r="7" fill="#F97316"/>
+    <circle cx="828" cy="268" r="6" fill="#A1A1AA"/>
+    <path d="M1102 260L1112 268L1102 276" fill="none" stroke="#A1A1AA" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
+
+  <text x="72" y="330" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+        font-size="20" fill="#71717A">no warm turns in history · retention is not guaranteed</text>
 </svg>

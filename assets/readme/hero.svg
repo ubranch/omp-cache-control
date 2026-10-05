@@ -1,21 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
-  <title id="title">omp-cache-control — prompt-cache visibility and idle-prefix refreshes</title>
-  <desc id="desc">An OMP native TUI extension. Observed Codex coding workflow: 80 real minutes, three automatic cache-hit refreshes, unchanged history, and successful resumed tool work. Maintenance is paid and provider retention is not guaranteed.</desc>
-  <rect width="1200" height="360" rx="24" fill="#0B1118"/>
-  <g id="identity" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif">
-    <text x="64" y="48" fill="#9AA9BA" font-size="20" letter-spacing="2">OMP / NATIVE TUI EXTENSION</text>
-    <text x="64" y="120" fill="#F4F7FA" font-size="68" font-weight="650" letter-spacing="-2">omp-cache-control</text>
-    <text x="64" y="166" fill="#F4F7FA" font-size="26">See prompt-cache reuse. Refresh eligible idle prefixes.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430"
+     role="img" aria-labelledby="title desc">
+  <title id="title">cache control — an omp extension</title>
+  <desc id="desc">Cache Control shows actual prompt-cache reuse and refreshes eligible idle prefixes. This is an illustrated command and status specimen, not a screenshot or current provider state. The three-call cost of $0.008034 comes from a historical ledger; the countdown is an example, not a recorded state. The footer labels represent latest-request cache-read percentage, an inferred countdown, and warm state; no live percentage is asserted. Paid upkeep starts on, hidden replies stay outside chat history, and provider retention is not guaranteed.</desc>
+
+  <rect width="1200" height="430" rx="24" fill="#0A0A0A"/>
+  <rect x="0.5" y="0.5" width="1199" height="429" rx="24" fill="none" stroke="#1C1C1F"/>
+
+  <g id="title-block">
+    <text x="72" y="68" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+          font-size="20" letter-spacing="4" fill="#F97316">OMP EXTENSION</text>
+    <text x="68" y="144" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Inter,sans-serif"
+          font-size="84" font-weight="800" letter-spacing="-3" fill="#FAFAFA">cache control</text>
+    <text x="72" y="194" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+          font-size="22" fill="#71717A">see real cache reuse. refresh eligible idle prefixes.</text>
   </g>
-  <path d="M64 198H1136" stroke="#263544" stroke-width="1"/>
-  <g id="observed-prefix" font-family="ui-monospace, Consolas, SFMono-Regular, Menlo, monospace">
-    <text x="64" y="230" fill="#9AA9BA" font-size="20">OBSERVED / CODEX CODING WORKFLOW</text>
-    <rect x="64" y="248" width="1072" height="8" rx="4" fill="#83E7C3"/>
-    <circle cx="744" cy="252" r="8" fill="#F0B879" stroke="#0B1118" stroke-width="3"/>
-    <text x="64" y="294" fill="#83E7C3" font-size="24">80 real minutes</text>
-    <text x="432" y="294" fill="#F4F7FA" font-size="24">3 automatic cache-hit refreshes</text>
-    <text x="64" y="332" fill="#F4F7FA" font-size="20">history unchanged</text>
-    <text x="432" y="332" fill="#F4F7FA" font-size="20">resumed tool work</text>
-    <text x="1136" y="332" fill="#F0B879" font-size="20" text-anchor="end">paid upkeep</text>
+
+  <g id="metadata" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="18"
+     fill="#52525B" text-anchor="end">
+    <text x="1128" y="68">paid upkeep starts on</text>
+    <text x="1128" y="96">no warm turns in history</text>
+    <text x="1128" y="124">retention not guaranteed</text>
+  </g>
+
+  <g id="cache-specimen" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <rect x="64" y="220" width="1072" height="180" rx="14" fill="#111113" stroke="#1C1C1F"/>
+    <text x="100" y="264" font-size="24" fill="#A1A1AA">❯</text>
+    <text x="128" y="264" font-size="24" fill="#FAFAFA">/cache warm</text>
+    <text x="1100" y="264" font-size="18" fill="#71717A" text-anchor="end">illustrated example</text>
+    <text x="100" y="300" font-size="22" fill="#E4E4E7">Cache warm next in 24:37; 3 calls;</text>
+    <text x="100" y="332" font-size="22" fill="#E4E4E7">estimated inference warm cost <tspan fill="#FAFAFA">$0.008034</tspan></text>
+    <line x1="88" y1="352" x2="1112" y2="352" stroke="#27272A" stroke-width="2"/>
+    <text x="100" y="384" font-size="22" fill="#A1A1AA" xml:space="preserve">cache-read %  ·  ~estimated time  ·  warm state</text>
   </g>
 </svg>
