@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">omp-cache-control — prompt-cache visibility and idle-prefix refreshes</title>
+  <desc id="desc">An OMP native TUI extension. Observed Codex coding workflow: 80 real minutes, three automatic cache-hit refreshes, unchanged history, and successful resumed tool work. Maintenance is paid and provider retention is not guaranteed.</desc>
+  <rect width="1200" height="360" rx="24" fill="#0B1118"/>
+  <g id="identity" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif">
+    <text x="64" y="48" fill="#9AA9BA" font-size="20" letter-spacing="2">OMP / NATIVE TUI EXTENSION</text>
+    <text x="64" y="120" fill="#F4F7FA" font-size="68" font-weight="650" letter-spacing="-2">omp-cache-control</text>
+    <text x="64" y="166" fill="#F4F7FA" font-size="26">See prompt-cache reuse. Refresh eligible idle prefixes.</text>
+  </g>
+  <path d="M64 198H1136" stroke="#263544" stroke-width="1"/>
+  <g id="observed-prefix" font-family="ui-monospace, Consolas, SFMono-Regular, Menlo, monospace">
+    <text x="64" y="230" fill="#9AA9BA" font-size="20">OBSERVED / CODEX CODING WORKFLOW</text>
+    <rect x="64" y="248" width="1072" height="8" rx="4" fill="#83E7C3"/>
+    <circle cx="744" cy="252" r="8" fill="#F0B879" stroke="#0B1118" stroke-width="3"/>
+    <text x="64" y="294" fill="#83E7C3" font-size="24">80 real minutes</text>
+    <text x="432" y="294" fill="#F4F7FA" font-size="24">3 automatic cache-hit refreshes</text>
+    <text x="64" y="332" fill="#F4F7FA" font-size="20">history unchanged</text>
+    <text x="432" y="332" fill="#F4F7FA" font-size="20">resumed tool work</text>
+    <text x="1136" y="332" fill="#F0B879" font-size="20" text-anchor="end">paid upkeep</text>
+  </g>
+</svg>
