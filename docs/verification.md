@@ -49,7 +49,16 @@ Do not read adapter presence as a successful live test across all providers, mod
 
 ## Regression checks are a different kind of proof
 
-### Published SDK 18.6.1: local verification
+### Compiled OMP 18.8.7: observed local verification
+
+The development SDKs now target **18.8.7**, with a reproducible upstream replay/abortable-reader bundle and static supported host imports. This change does not carry forward the 18.6.1 pass as an 18.8.7 result.
+
+Required checks are `bun run build:cache-replay`, `bun run typecheck`, `bun run test`, and `bun run test:compiled` with the exact native compiled host on `PATH` or in `OMP_COMPILED_CLI`. The added [compiled-CLI E2E](../tests/compiled-cli.test.ts) launches isolated RPC mode with an empty profile, sends no prompt, and requires `/cache` advertisement without extension load failures. It rejects a source launcher and uses an explicit process-deadline flag.
+
+On **2026-10-10**, Windows/Bun **1.4.2** passed helper generation, strict TypeScript checking, all **189 existing regressions / 1,448 assertions**, and the new compiled-CLI E2E against native OMP **18.8.7**. The regression suite retained its native-loopback privacy and consumer-cancellation cases. A separate isolated startup loaded the native-linked Cache Control together with twelve other active custom extension entries, advertised `/cache`, `/ysk`, and `/atlas`, and exited zero with empty stderr; no prompt or real credential was supplied. These checks are not new live-provider, native-TUI, or retention evidence.
+
+
+### Published SDK 18.6.1: historical local verification
 
 Local public-release verification passed **strict TypeScript checking and all 189 permanent tests** (1,448 expectations) against published OMP SDK **18.6.1** and Bun **1.4.2**. This is separate from the historical live observations above, not new provider-retention or native-TUI evidence.
 

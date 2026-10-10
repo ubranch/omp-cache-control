@@ -5,9 +5,9 @@
 
 <p>
 <img src="https://img.shields.io/badge/typescript-1E1E22?style=flat-square" alt="TypeScript">
-<img src="https://img.shields.io/badge/omp_18.6-1E1E22?style=flat-square" alt="Tested against omp SDK 18.6.1">
+<img src="https://img.shields.io/badge/omp_18.8.7-1E1E22?style=flat-square" alt="Compatibility target: compiled omp 18.8.7">
 <img src="https://img.shields.io/badge/1_runtime_dep-1E1E22?style=flat-square" alt="1 runtime dependency: @smithy/core">
-<img src="https://img.shields.io/badge/189_tests-1E1E22?style=flat-square" alt="189 permanent tests">
+<img src="https://img.shields.io/badge/regression_suite-1E1E22?style=flat-square" alt="Controlled regressions and compiled CLI load E2E">
 <a href="#install"><img src="https://img.shields.io/badge/install-F97316?style=flat-square&labelColor=1E1E22" alt="Install"></a>
 </p>
 
@@ -47,7 +47,7 @@ For visibility without paid upkeep, run `/cache warm off`. This lasts only for t
    omp plugin install github:ubranch/omp-cache-control
    ```
 
-   Installation includes the pinned production dependency `@smithy/core@3.35.0` for Bedrock binary-frame privacy guards. Runtime uses the host's OMP SDK; do not add SDK shims or describe the plugin as dependency-free.
+   Installation includes the pinned production dependency `@smithy/core@3.35.0` for Bedrock binary-frame privacy guards and the generated upstream replay/reader helper bundle. Supported SDK exports resolve through the host's registry; do not add SDK shims or describe the plugin as dependency-free.
 3. Fully exit and restart omp. `/reload-plugins` does not reload this TypeScript extension. In **Settings → Appearance → Status Line**, choose the `custom` preset and add `status` to **Left Segments**, preserving the user's existing segments.
 
 ### use during real coding work
@@ -174,17 +174,17 @@ Load Cache Control **after payload-transforming extensions**. Later in-place edi
 
 <br>
 
-The **2026-10-05** real coding workflow used OMP CLI **18.5.1**, locally installed SDK **18.6.0** packages, and **`openai-codex/gpt-6.1-sol/high`**. It is **not a new live observation of the public release with SDK 18.6.1**.
+The **2026-10-05** real coding workflow used OMP CLI **18.5.1**, locally installed SDK **18.6.0** packages, and **`openai-codex/gpt-6.1-sol/high`**. It is **not a new live observation of the current compiled OMP 18.8.7 target**.
 
 - **80.0475 real minutes; 3 automatic cache-hit refreshes.** No modified clock or manual force warming. Branch and assistant-message IDs stayed unchanged after each refresh; hidden replies did not add history or extend the foreground chain.
 - **Resumed tool work after roughly 50 minutes:** 23,936 `cacheRead` tokens on resume and 25,856 on the final request, with real read/write/edit/bash tools and successful consumer CLI outcomes.
 - **$0.008034 estimated inference warm cost for 3 calls.** Separate from the native footer; excludes foreground work, native recaps, unknown/unpriced costs, and cache-storage billing. It is not an invoice, savings estimate, quota measurement, or benchmark against disabling the extension.
 
-Claude also passed a **live bounded warm-up with `max_tokens: 1`**, not an equivalent 80-minute soak or new SDK 18.6.1 live proof. Other adapters are source-supported under guards, not universally live-tested.
+Claude also passed a **live bounded warm-up with `max_tokens: 1`**, not an equivalent 80-minute soak or new SDK 18.8.7 live proof. Other adapters are source-supported under guards, not universally live-tested.
 
 omp's long-idle foreground chain did retry/fall back to full context before continuing. Not all requests stayed incremental.
 
-The **189-test** badge refers to the public-release regression suite against SDK **18.6.1**, not new live-provider retention evidence.
+The historical **189-test** public-release result used SDK **18.6.1**. The current SDK pin and added compiled-CLI load E2E do not imply those checks have passed on 18.8.7; see the verification record.
 
 [Full evidence, controls, local verification, and what this does not prove](docs/verification.md)
 
@@ -232,9 +232,9 @@ While loaded in the native TUI, this extension stops omp's own warmer—even whe
 
 ## development
 
-Normal runtime uses **the host's SDK first**; no extension-local SDK repair is needed. The one production dependency, **`@smithy/core`**, supplies the public Smithy Bedrock codec, not a bundled omp SDK.
+Runtime uses **static supported host SDK imports**, not filesystem resolution beside the executable. The shipped `cache-control-replay.js` bundles the two upstream Responses replay helpers and `abortableSource` from **exact SDK 18.8.7** because their source subpaths are not exposed by the compiled host. Public utility and transform-message exports remain host-resolved. The one production dependency, **`@smithy/core@3.35.0`**, supplies the public Smithy Bedrock codec.
 
-Development targets **OMP 18.6.1 SDKs** and **Bun ≥ 1.3.14**. The lowest compatible OMP host version is not established.
+Development and the compiled-host compatibility target are **OMP 18.8.7** with **Bun ≥ 1.3.14**. Earlier or later hosts are not established. After changing SDK pins, regenerate the helper bundle and run the complete controlled regressions plus the real compiled-CLI E2E before claiming compatibility; a load check does not prove paid warming or provider retention.
 
 [Contributing and release procedure](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [CI](https://github.com/ubranch/omp-cache-control/actions) · [Releases](https://github.com/ubranch/omp-cache-control/releases)
 

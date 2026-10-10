@@ -1,32 +1,13 @@
-import { dirname } from "node:path";
 import { EventStreamCodec, getChunkedStream } from "@smithy/core/event-streams";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
-import type * as AiSDK from "@oh-my-pi/pi-ai";
-import type * as ErrorsSDK from "@oh-my-pi/pi-ai/error";
-import type * as ResponsesSDK from "@oh-my-pi/pi-ai/utils";
-import type * as GoogleAuthSDK from "@oh-my-pi/pi-ai/providers/google-auth";
-import type * as CatalogHostsSDK from "@oh-my-pi/pi-catalog/hosts";
-import type * as StreamsSDK from "@oh-my-pi/pi-utils/stream";
-import type * as AbortableSDK from "@oh-my-pi/pi-utils/abortable";
+import * as ai from "@oh-my-pi/pi-ai";
+import * as errors from "@oh-my-pi/pi-ai/error";
+import * as responses from "./cache-control-replay.js";
+import { abortableSource } from "./cache-control-replay.js";
+import * as googleAuth from "@oh-my-pi/pi-ai/providers/google-auth";
+import * as catalogHosts from "@oh-my-pi/pi-catalog/hosts";
+import * as streams from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-
-// Resolve import-only SDK exports beside the running OMP, not a fixed-install junction.
-// The local base also supports standalone development with published SDK packages.
-function sdkPath(specifier: string): string {
-	if (process.argv[1]) {
-		try { return Bun.resolveSync(specifier, dirname(process.argv[1])); } catch { /* Try local development dependencies. */ }
-	}
-	return Bun.resolveSync(specifier, import.meta.dir);
-}
-const [ai, errors, responses, googleAuth, catalogHosts, streams, abortables] = await Promise.all([
-	import(sdkPath("@oh-my-pi/pi-ai")) as Promise<typeof AiSDK>,
-	import(sdkPath("@oh-my-pi/pi-ai/error")) as Promise<typeof ErrorsSDK>,
-	import(sdkPath("@oh-my-pi/pi-ai/utils.js")) as Promise<typeof ResponsesSDK>,
-	import(sdkPath("@oh-my-pi/pi-ai/providers/google-auth")) as Promise<typeof GoogleAuthSDK>,
-	import(sdkPath("@oh-my-pi/pi-catalog/hosts")) as Promise<typeof CatalogHostsSDK>,
-	import(sdkPath("@oh-my-pi/pi-utils/stream")) as Promise<typeof StreamsSDK>,
-	import(sdkPath("@oh-my-pi/pi-utils/abortable")) as Promise<typeof AbortableSDK>,
-]);
 
 const REPLAY_APIS: Record<string, true> = {
 	"openai-codex-responses": true, "anthropic-messages": true, "bedrock-converse-stream": true,
@@ -56,7 +37,7 @@ const BEDROCK_SUCCESS_STOP_REASONS: Record<string, true> = {
 // ~ is an estimate, not a server TTL or eviction guarantee. Warm cost is separate.
 // Only reported cache reuse refreshes the estimate; misses retain the normal cadence.
 // A miss shows "warm miss" and unknown expiry; the next scheduled hit restores the estimate.
-// SDK imports follow the running OMP installation; no extension-local junction repair is needed.
+// Static SDK imports use the host registry; the generated helpers retain pinned upstream replay and reader behavior.
 // Stateful Codex deltas expand only from the last verified foreground wire input
 // and native replayable output, committed by the awaited assistant_message hook.
 // Delayed message_end notifications never authorize replay of another request.
@@ -315,7 +296,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 						const encoder = new TextEncoder();
 						const decoder = bedrock ? new TextDecoder() : undefined;
 						const codec = decoder ? new EventStreamCodec(bytes => decoder.decode(bytes), text => encoder.encode(text)) : undefined;
-						const chunks = bedrock ? abortables.abortableSource(response.body, signal) : undefined;
+						const chunks = bedrock ? abortableSource(response.body, signal) : undefined;
 						const frames = chunks ? (async function* () {
 							try {
 								yield* getChunkedStream(chunks);
@@ -344,7 +325,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 										controller.enqueue(raw);
 										return;
 									}
-									const event = frame.value as StreamsSDK.ServerSentEvent;
+									const event = frame.value as streams.ServerSentEvent;
 									let data: unknown;
 									let malformed = false;
 									try { data = JSON.parse(event.data); } catch {

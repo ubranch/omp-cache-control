@@ -2,6 +2,12 @@
 
 [← README](../README.md) · [Lifecycle and status](lifecycle.md) · [Verification](verification.md)
 
+## Host compatibility boundary
+
+The current target is the **standalone compiled OMP CLI 18.8.7**, with exact matching development SDK pins. Static supported SDK imports use the host registry. A shipped, reproducible helper bundle preserves upstream Responses replay and abortable-reader implementations from 18.8.7 for source subpaths the compiled registry does not expose; it does not bundle a second provider SDK. Bedrock framing still uses the separately installed public `@smithy/core@3.35.0` codec.
+
+Earlier or later host compatibility is not established. Pin changes require regeneration, the complete existing regressions, and the real compiled-CLI load E2E before claiming support. Command advertisement proves loading only, not privacy under every provider failure or paid maintenance; historical live evidence keeps its original version boundary.
+
 ## Paid automatic maintenance is on by default
 
 After a successful, eligible real request, an idle native TUI can send **paid hidden refresh requests** automatically. It is not just a display extension. To retain visibility without maintenance:

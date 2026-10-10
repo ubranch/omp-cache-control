@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["cache-control.ts", "tests/**/*.ts"]
+  "include": ["cache-control.ts", "cache-control-replay-entry.ts", "build-cache-replay.ts", "tests/**/*.ts"]
 }

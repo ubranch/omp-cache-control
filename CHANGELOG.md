@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — 2026-10-10
+
+- Target compiled OMP **18.8.7** with matching exact development SDK pins; retain `@smithy/core@3.35.0`. Replace executable-adjacent dynamic SDK resolution with static supported host imports without changing Bedrock guards, streaming errors, cancellation, or diagnostic privacy.
+- Add a reproducible, version-checked upstream helper bundle for Responses replay and the unexposed abortable reader, with upstream types/license and distributable build entry/script. Keep public utility and transform-message exports host-resolved instead of bundling another SDK.
+- Add an isolated real compiled-CLI RPC E2E requiring `/cache` advertisement and no extension load failures. Windows/Bun 1.4.2 verification passed helper generation, strict TypeScript, all 189 existing regressions (1,448 assertions), and the compiled OMP 18.8.7 E2E. No new live-provider evidence is claimed.
+
 ## 1.0.0 — 2026-10-05
 
 Initial standalone distribution of the existing OMP Cache Control extension.
