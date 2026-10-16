@@ -40,7 +40,7 @@ The replay snapshot is committed after the foreground request settles, including
 
 Refreshes preserve cache-affecting prompt fields rather than removing tools, thinking, or modalities just to make a request pass. Where a cache-safe bounded request cannot be constructed, the extension reports **unavailable** instead.
 
-- Codex uses an isolated native WebSocket, a small hidden reply instruction, and a 16-token cap. The GPT-6 family gets a low-effort configuration update for this hidden request. HTTP fallback and automatic retries are refused.
+- Codex uses an isolated native WebSocket, a small hidden reply instruction, and a 16-token cap. The GPT-6 family gets a low-effort configuration update for this hidden request. HTTP fallback and within-request transport retries are refused.
 - Anthropic/Bedrock use a 1-token native output cap. Anthropic's streaming endpoint rejects `max_tokens: 0`, so zero is not used.
 - OpenAI Responses/Azure use 16 tokens. OpenAI Completions uses 1 token, or 16 for reasoning-enabled requests. Tool definitions remain present; `tool_choice: none` prevents execution without dropping cached definitions.
 - Google/Ollama inference adapters use a 1-token native cap. Unsafe Google tools or non-text generation are refused.
@@ -48,7 +48,9 @@ Refreshes preserve cache-affecting prompt fields rather than removing tools, thi
 
 Each hidden inference refresh permits **at most one actual inference send**, not merely one payload construction. Native transport retries are refused before a second send; authentication and cache-metadata requests are not inference sends.
 
-The response must also prove bounded, usable completion. Unexpected tool/image output, oversized text, invalid usage, or a failed transport stops warming. There is no retry-and-bill loop.
+The response must also prove bounded, usable completion. Unexpected tool/image output, oversized text, invalid usage, or an ambiguous failed transport pauses that snapshot without automatic replay. A new successful eligible real request can recover without changing manual opt-out.
+
+Only a definitive HTTP 429 rejection permits bounded scheduled retries: three per snapshot, at least 60/120/240 seconds apart, respecting later provider retry headers. HTTP 402 and structured in-stream quota errors impose cooldown without automatically replaying possibly accepted work. Cooldowns survive session/model changes and cannot be overridden by commands or fresh foreground requests. A timeout never authorizes an automatic resend. See [failure recovery](lifecycle.md#completion-misses-and-failures).
 
 Successful SSE terminal markers close only that response transport, not the whole warm job, preserving completion and usage accounting. Response-local abort, zero read-ahead, and explicit iterator return prevent continued consumption after completion.
 

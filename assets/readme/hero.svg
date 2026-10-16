@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430"
      role="img" aria-labelledby="title desc">
   <title id="title">cache control — an omp extension</title>
-  <desc id="desc">Cache Control shows actual prompt-cache reuse and refreshes eligible idle prefixes. This is an illustrated command and status specimen, not a screenshot or current provider state. The three-call cost of $0.008034 comes from a historical ledger; the countdown is an example, not a recorded state. The footer labels represent latest-request cache-read percentage, an inferred countdown, and warm state; no live percentage is asserted. Paid upkeep starts on, hidden replies stay outside chat history, and provider retention is not guaranteed.</desc>
+  <desc id="desc">Cache Control shows an estimated prompt-cache expiry countdown and refreshes eligible idle prefixes. This is an illustrated command and status specimen, not a screenshot or current provider state. The three-call cost of $0.008034 comes from a historical ledger; the countdown is an example, not a recorded state. The footer shows only the estimated expiry countdown; warm details remain in /cache warm. Paid upkeep starts on, hidden replies stay outside chat history, and provider retention is not guaranteed.</desc>
 
   <rect width="1200" height="430" rx="24" fill="#0A0A0A"/>
   <rect x="0.5" y="0.5" width="1199" height="429" rx="24" fill="none" stroke="#1C1C1F"/>
@@ -12,7 +12,7 @@
     <text x="68" y="144" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Inter,sans-serif"
           font-size="84" font-weight="800" letter-spacing="-3" fill="#FAFAFA">cache control</text>
     <text x="72" y="194" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
-          font-size="22" fill="#71717A">see real cache reuse. refresh eligible idle prefixes.</text>
+          font-size="22" fill="#71717A">watch the cache timer. refresh eligible idle prefixes.</text>
   </g>
 
   <g id="metadata" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="18"
@@ -30,6 +30,6 @@
     <text x="100" y="300" font-size="22" fill="#E4E4E7">Cache warm next in 24:37; 3 calls;</text>
     <text x="100" y="332" font-size="22" fill="#E4E4E7">estimated inference warm cost <tspan fill="#FAFAFA">$0.008034</tspan></text>
     <line x1="88" y1="352" x2="1112" y2="352" stroke="#27272A" stroke-width="2"/>
-    <text x="100" y="384" font-size="22" fill="#A1A1AA" xml:space="preserve">cache-read %  ·  ~estimated time  ·  warm state</text>
+    <text x="100" y="384" font-size="22" fill="#A1A1AA" xml:space="preserve">~29:50</text>
   </g>
 </svg>

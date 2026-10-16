@@ -1,7 +1,13 @@
 # Changelog
 
-## Unreleased — 2026-10-10
+## Unreleased — 2026-10-11
 
+- Fix Anthropic warm refreshes rejected with HTTP 400: the empty warm context dropped body-derived betas, so replayed `output_config.task_budget`, `context_management`, effort, compaction, and fast-mode fields lacked their `anthropic-beta`. Warming now restores them from the captured body.
+- Add native `/cache` argument autocomplete with prefix filtering, nested `warm` options, and paid-action descriptions. Tab accepts complete arguments; unknown prefixes and terminal arguments followed by whitespace have no command suggestions. Command, timer, and warming behavior is unchanged.
+- Show only the existing estimated cache-expiry countdown in Cache Control's status segment; hide it when no countdown is available or it has expired. Keep `/cache warm` details, other OMP status segments, and warming behavior unchanged.
+- Preserve verified foreground snapshots across trailing native background title hooks, with turn-scoped capture and conservative request-ownership checks. Ambiguous concurrent/rebuilt payloads remain unavailable rather than warming the wrong prefix; real tool continuations open a new capture window.
+- Separate operational pauses from manual opt-out. Recover after a successful eligible foreground request, bound definitive HTTP 429 retries to three per snapshot, honor provider retry headers, and enforce instance-wide quota cooldowns. Never automatically replay timed-out or ambiguously charged work.
+- Preserve manual switches across session shutdown/start, explicitly block maintenance during foreground work, and prevent catch-up bursts or re-enable commands from shortening the successful-completion scheduling floor.
 - Target compiled OMP **18.8.7** with matching exact development SDK pins; retain `@smithy/core@3.35.0`. Replace executable-adjacent dynamic SDK resolution with static supported host imports without changing Bedrock guards, streaming errors, cancellation, or diagnostic privacy.
 - Add a reproducible, version-checked upstream helper bundle for Responses replay and the unexposed abortable reader, with upstream types/license and distributable build entry/script. Keep public utility and transform-message exports host-resolved instead of bundling another SDK.
 - Add an isolated real compiled-CLI RPC E2E requiring `/cache` advertisement and no extension load failures. Windows/Bun 1.4.2 verification passed helper generation, strict TypeScript, all 189 existing regressions (1,448 assertions), and the compiled OMP 18.8.7 E2E. No new live-provider evidence is claimed.

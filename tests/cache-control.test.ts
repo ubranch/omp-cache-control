@@ -22,6 +22,8 @@ import type { AssistantMessage, AssistantMessageEvent, StreamOptions } from "@oh
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { EventStreamCodec } from "@smithy/core/event-streams";
 import { SYMBOL_PRESETS, type SymbolKey, type SymbolPreset } from "@oh-my-pi/pi-tui/theme/symbols";
+import { CombinedAutocompleteProvider, Editor, type SlashCommand } from "@oh-my-pi/pi-tui";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme";
 import cacheControl from "../cache-control";
 
 // bun run test
@@ -87,9 +89,9 @@ function surface() {
 				getSymbolPreset: () => preset,
 			};
 		},
-		setTitle: () => {},
+		setTitle: () => { },
 		setStatus: (_key: string, text: string | undefined) => { status = text; },
-		setWidget: () => {},
+		setWidget: () => { },
 		notify: (text: string) => { notifications.push(text); },
 	};
 	return {
@@ -152,14 +154,19 @@ type EventContext = { ctx: ExtensionContext };
 function harness() {
 	const hooks = new Map<string, Hook[]>();
 	const commands: Record<string, Command> = {};
+	const autocompleteCommands: SlashCommand[] = [];
 	// Only public extension hooks/UI/timer/auth and the paid SDK boundary are supplied.
 	cacheControl({
 		on: (name: string, handler: Hook) => {
 			hooks.set(name, [...(hooks.get(name) ?? []), handler]);
 		},
-		registerCommand: (name: string, options: { handler: Command }) => { commands[name] = options.handler; },
+		registerCommand: (name: string, options: { handler: Command; getArgumentCompletions?: SlashCommand["getArgumentCompletions"] }) => {
+			commands[name] = options.handler;
+			autocompleteCommands.push({ name, getArgumentCompletions: options.getArgumentCompletions });
+		},
 	} as unknown as ExtensionAPI);
 	return {
+		autocompleteCommands,
 		async emit(name: string, c: EventContext, event: Record<string, unknown> = {}) {
 			let result: unknown;
 			for (const handler of hooks.get(name) ?? []) result = await handler(event, c.ctx);
@@ -215,11 +222,13 @@ function isNativeApi<TApi extends ai.Api>(model: ai.Model, api: TApi): model is 
 
 function codexWarmInput(input: unknown[]): unknown[] {
 	return [...input, { type: "configuration_update", reasoning: { effort: "low" } },
-		{ role: "user", content: [{ type: "input_text", text: "Reply with only: ok" }] }];
+	{ role: "user", content: [{ type: "input_text", text: "Reply with only: ok" }] }];
 }
 
-function paidBoundary(frame: Record<string, unknown> = { type: "response.create", stream: true,
-	client_metadata: { turn_id: "warm-turn", "x-codex-turn-metadata": "new-identity" } }) {
+function paidBoundary(frame: Record<string, unknown> = {
+	type: "response.create", stream: true,
+	client_metadata: { turn_id: "warm-turn", "x-codex-turn-metadata": "new-identity" }
+}) {
 	const sends: Record<string, unknown>[] = [];
 	const streams: ai.AssistantMessageEventStream[] = [];
 	const signals: AbortSignal[] = [];
@@ -236,8 +245,12 @@ function paidBoundary(frame: Record<string, unknown> = { type: "response.create"
 				const outgoing = await opts?.onPayload?.(frame);
 				sends.push(outgoing as Record<string, unknown>);
 			} catch {
-				events.push({ type: "error", reason: "error", error: warmReply({ stopReason: "error",
-					errorMessage: "Raw provider detail must never appear" }) });
+				events.push({
+					type: "error", reason: "error", error: warmReply({
+						stopReason: "error",
+						errorMessage: "Raw provider detail must never appear"
+					})
+				});
 			}
 		});
 		return events;
@@ -260,10 +273,12 @@ async function realRequest(h: { emit(name: string, c: EventContext, event?: Reco
 	c: EventContext & { history: AssistantMessage[] },
 	body = payload(), message = assistant(usage(128, 1_920, 0), { timestamp: Date.now() })) {
 	await h.emit("before_agent_start", c);
+	await h.emit("turn_start", c, { turnIndex: 0 });
 	await h.emit("before_provider_request", c, { payload: body });
 	await h.emit("assistant_message", c, { message });
 	c.history.push(message);
 	await h.emit("message_end", c, { message });
+	await h.emit("turn_end", c);
 	await h.emit("agent_end", c);
 }
 
@@ -286,13 +301,13 @@ test("paid warms wait 25 minutes, stay single-flight, and leave foreground metri
 	c.tick();
 	await settle();
 	expect(wire.sends).toHaveLength(1);
-	expect(c.status).toContain("warming");
-	expect(c.status).toMatch(/\b94%/);
+	expect(c.status).toBe("~5:00");
+	await h.command(c, "warm");
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm running;/);
 	wire.finish();
 	await settle();
 	expect(wire.disposed).toBe(1);
-	expect(c.status).toMatch(/~30:00\b/);
-	expect(c.status).toMatch(/\b94%/);
+	expect(c.status).toBe("~30:00");
 	clock.mockReturnValue(NOW + 6_599_999);
 	c.tick();
 	await settle();
@@ -306,6 +321,7 @@ test("paid warms wait 25 minutes, stay single-flight, and leave foreground metri
 	await h.command(c, "warm");
 	expect(c.notifications.at(-1)).toMatch(/2 calls.*\$0\.000896/);
 	expect(c.history).toHaveLength(1);
+	expect(c.history[0].usage).toEqual(usage(128, 1_920));
 	await h.emit("session_shutdown", c);
 });
 
@@ -338,45 +354,46 @@ test("real requests reset paid cadence; busy and queued states defer rather than
 	expect(wire.sends).toHaveLength(1);
 	wire.finish();
 	await settle();
-	expect(c.status).toMatch(/~30:00\b/);
+	expect(c.status).toBe("~30:00");
 	await h.emit("session_shutdown", c);
 });
 
 test.each(["before_agent_start", "session_switch", "session_branch", "session_tree", "session_compact",
 	"session_shutdown", "off", "warm off", "model", "session"] as const)(
-	"%s cancels a paid request and stale completion cannot claim a fresh cache",
-	async action => {
-		const h = harness();
-		const c = context();
-		const wire = paidBoundary();
-		await h.emit("session_start", c);
-		await realRequest(h, c);
-		clock.mockReturnValue(NOW + 1_500_000);
-		c.tick();
-		await settle();
-		expect(wire.sends).toHaveLength(1);
-		if (action === "off" || action === "warm off") await h.command(c, action);
-		else if (action === "model") { c.model.id = "another-model"; c.tick(); }
-		else if (action === "session") { c.setSession("another-session"); c.tick(); }
-		else await h.emit(action, c);
-		expect(wire.signals[0].aborted).toBe(true);
-		wire.finish();
-		await settle();
-		expect(wire.disposed).toBe(1);
-		expect(c.status ?? "").not.toContain("~30:00");
-		clock.mockReturnValue(NOW + 4_000_000);
-		c.tick();
-		await settle();
-		expect(wire.sends).toHaveLength(1);
-		await h.emit("session_shutdown", c);
-	},
-);
+		"%s cancels a paid request and stale completion cannot claim a fresh cache",
+		async action => {
+			const h = harness();
+			const c = context();
+			const wire = paidBoundary();
+			await h.emit("session_start", c);
+			await realRequest(h, c);
+			clock.mockReturnValue(NOW + 1_500_000);
+			c.tick();
+			await settle();
+			expect(wire.sends).toHaveLength(1);
+			if (action === "off" || action === "warm off") await h.command(c, action);
+			else if (action === "model") { c.model.id = "another-model"; c.tick(); }
+			else if (action === "session") { c.setSession("another-session"); c.tick(); }
+			else await h.emit(action, c);
+			expect(wire.signals[0].aborted).toBe(true);
+			wire.finish();
+			await settle();
+			expect(wire.disposed).toBe(1);
+			if (action === "off" || action === "session_shutdown" || action === "model") expect(c.status).toBeUndefined();
+			else expect(c.status).toBe("~5:00");
+			clock.mockReturnValue(NOW + 4_000_000);
+			c.tick();
+			await settle();
+			expect(wire.sends).toHaveLength(1);
+			await h.emit("session_shutdown", c);
+		},
+	);
 
 test("session changes during auth never dispatch old prefixes; shutdown also bounds unresolved auth", async () => {
 	const h = harness();
 	const c = context();
 	const wire = paidBoundary();
-	let resolveAuth: (value: string) => void = () => {};
+	let resolveAuth: (value: string) => void = () => { };
 	c.setAuth(() => new Promise<string>(resolve => { resolveAuth = resolve; }));
 	await h.emit("session_start", c);
 	await realRequest(h, c);
@@ -423,8 +440,8 @@ test.each(["restored", "small", "failed", "wrong-model", "wrong-provider", "wron
 		expect(wire.sends).toHaveLength(0);
 		if (scenario === "incremental") {
 			expect(c.notifications.join(" ")).toContain("verified matching");
-			expect(c.status).toMatch(/warm (?:pending|unavailable)/);
-			expect(c.status).not.toContain("warm off");
+			expect(c.status).toBeUndefined();
+			expect(c.notifications.at(-1)).toMatch(/^Cache warm (?:pending|unavailable);/);
 		}
 		await h.emit("session_shutdown", c);
 	},
@@ -436,10 +453,14 @@ test("Codex full then same-agent and next-agent deltas replay native items exact
 	const wire = paidBoundary();
 	const full = payload();
 	const first = nativeReply("response_full", [
-		{ type: "reasoning", id: "rs_custom", status: "completed", summary: [],
-			encrypted_content: "synthetic-encrypted-custom-reasoning" },
-		{ type: "custom_tool_call", id: "ctc_custom", status: "completed", call_id: "custom-one",
-			name: "apply_patch", input: "*** synthetic patch ***" },
+		{
+			type: "reasoning", id: "rs_custom", status: "completed", summary: [],
+			encrypted_content: "synthetic-encrypted-custom-reasoning"
+		},
+		{
+			type: "custom_tool_call", id: "ctc_custom", status: "completed", call_id: "custom-one",
+			name: "apply_patch", input: "*** synthetic patch ***"
+		},
 	], usage(512));
 	const firstReplay = nativeReplay(first);
 	expect(first.providerPayload).toMatchObject({ type: "openaiResponsesHistory", provider: "openai-codex", dt: true });
@@ -458,6 +479,7 @@ test("Codex full then same-agent and next-agent deltas replay native items exact
 	// Tool continuation uses another provider request in the same agent lifecycle.
 	const customResult = { type: "custom_tool_call_output", call_id: "custom-one", output: "Before hook" };
 	const delta = payload({ type: "response.create", previous_response_id: "response_full", input: [customResult] });
+	await h.emit("turn_start", c, { turnIndex: 1 });
 	await h.emit("before_provider_request", c, { payload: delta });
 	customResult.output = "Final custom result";
 	(delta.input as unknown[]).push({ role: "developer", content: [{ type: "input_text", text: "Final hook input" }] });
@@ -472,20 +494,29 @@ test("Codex full then same-agent and next-agent deltas replay native items exact
 	await h.command(c, "warm now");
 	expect(wire.sends).toHaveLength(0);
 	const second = nativeReply("response_tools", [
-		{ type: "reasoning", id: "rs_computer", status: "completed", summary: [],
-			encrypted_content: "synthetic-encrypted-computer-reasoning" },
-		{ type: "computer_call", id: "cu_computer", status: "completed", call_id: "computer-one",
-			action: { type: "screenshot" }, pending_safety_checks: [] },
+		{
+			type: "reasoning", id: "rs_computer", status: "completed", summary: [],
+			encrypted_content: "synthetic-encrypted-computer-reasoning"
+		},
+		{
+			type: "computer_call", id: "cu_computer", status: "completed", call_id: "computer-one",
+			action: { type: "screenshot" }, pending_safety_checks: []
+		},
 	]);
 	const secondReplay = nativeReplay(second);
-	expect(secondReplay[0]).toEqual({ type: "reasoning", id: "rs_computer", summary: [],
-		encrypted_content: "synthetic-encrypted-computer-reasoning" });
-	expect(secondReplay[1]).toMatchObject({ type: "computer_call", id: "cu_computer", call_id: "computer-one",
-		action: { type: "screenshot" }, pending_safety_checks: [] });
+	expect(secondReplay[0]).toEqual({
+		type: "reasoning", id: "rs_computer", summary: [],
+		encrypted_content: "synthetic-encrypted-computer-reasoning"
+	});
+	expect(secondReplay[1]).toMatchObject({
+		type: "computer_call", id: "cu_computer", call_id: "computer-one",
+		action: { type: "screenshot" }, pending_safety_checks: []
+	});
 	await h.emit("assistant_message", c, { message: second });
 	c.history.push(second);
 	await h.emit("message_end", c, { message: second });
 	await h.emit("message_end", c, { message: second });
+	await h.emit("agent_end", c);
 	const warmFirst = h.command(c, "warm now");
 	await settle();
 	expect(wire.sends).toHaveLength(1);
@@ -507,21 +538,24 @@ test("Codex full then same-agent and next-agent deltas replay native items exact
 	wire.finish(warmReply({ responseId: "response_hidden", providerPayload: hiddenPayload }));
 	await warmFirst;
 	expect(c.history).toEqual([first, second]);
-	await h.emit("agent_end", c);
 
 	// A new agent start keeps the committed foreground baseline, not the hidden response.
 	await h.emit("before_agent_start", c);
-	const next = payload({ type: "response.create", previous_response_id: "response_tools", input: [{
-		type: "computer_call_output", call_id: "computer-one",
-		output: { type: "input_image", image_url: "data:image/png;base64,c3ludGhldGlj" },
-	}] });
+	const next = payload({
+		type: "response.create", previous_response_id: "response_tools", input: [{
+			type: "computer_call_output", call_id: "computer-one",
+			output: { type: "input_image", image_url: "data:image/png;base64,c3ludGhldGlj" },
+		}]
+	});
 	await h.emit("before_provider_request", c, { payload: next });
 	const replacement = [...(next.input as unknown[]),
-		{ role: "user", content: [{ type: "input_text", text: "Final replacement-array input" }] }];
+	{ role: "user", content: [{ type: "input_text", text: "Final replacement-array input" }] }];
 	next.input = replacement;
-	Object.assign(next, { instructions: "Next final instructions", headers: { "X-Synthetic-Hook": "next-header" },
+	Object.assign(next, {
+		instructions: "Next final instructions", headers: { "X-Synthetic-Hook": "next-header" },
 		options: { temperature: 0.5 }, prompt_cache_key: "next-cache-key", prompt_cache_retention: "in_memory",
-		tools: [{ type: "function", name: "read", parameters: { type: "object", properties: { path: { type: "string" } } } }] });
+		tools: [{ type: "function", name: "read", parameters: { type: "object", properties: { path: { type: "string" } } } }]
+	});
 	const finalNext = structuredClone(next);
 	const third = nativeReply("response_next");
 	await h.emit("assistant_message", c, { message: third });
@@ -536,9 +570,11 @@ test("Codex full then same-agent and next-agent deltas replay native items exact
 		...(finalFull.input as unknown[]), ...firstReplay, ...(finalDelta.input as unknown[]),
 		...secondReplay, ...replacement,
 	]));
-	expect(wire.sends[1]).toMatchObject({ instructions: next.instructions, headers: next.headers,
+	expect(wire.sends[1]).toMatchObject({
+		instructions: next.instructions, headers: next.headers,
 		options: next.options, tools: next.tools, reasoning: next.reasoning, prompt_cache_key: "next-cache-key",
-		prompt_cache_retention: "in_memory", tool_choice: "none" });
+		prompt_cache_retention: "in_memory", tool_choice: "none"
+	});
 	expect(wire.sends[1].previous_response_id).toBeUndefined();
 	expect(next.input).toBe(replacement);
 	expect(next).toEqual(finalNext);
@@ -569,6 +605,7 @@ test.each(["error", "aborted", "cut-off"] as const)(
 		await h.emit("assistant_message", c, { message: second });
 		c.history.push(second);
 		const current = payload({ input: [{ role: "user", content: "Current full request C" }] });
+		await h.emit("turn_start", c, { turnIndex: 1 });
 		await h.emit("before_provider_request", c, { payload: current });
 		await h.emit("message_end", c, { message: second });
 		await h.emit("message_end", c, { message: second });
@@ -629,8 +666,8 @@ test.each(["unknown", "mismatched"] as const)(
 		expect(wire.sends).toHaveLength(0);
 		expect(provider).not.toHaveBeenCalled();
 		expect(c.notifications.at(-1)).toContain("verified matching");
-		expect(c.status).toMatch(/warm (?:pending|unavailable)/);
-		expect(c.status).not.toContain("warm off");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm (?:pending|unavailable);/);
 		const recovered = payload({ input: [{ role: "user", content: "Recovered actual full prefix" }] });
 		await realRequest(h, c, recovered, nativeReply("response_recovered"));
 		const completion = h.command(c, "warm now");
@@ -640,7 +677,9 @@ test.each(["unknown", "mismatched"] as const)(
 		expect(wire.sends[0].previous_response_id).toBeUndefined();
 		wire.finish();
 		await completion;
-		expect(c.status).not.toContain("warm off");
+		expect(c.status).toBe("~30:00");
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in /);
 		await h.emit("session_shutdown", c);
 	},
 );
@@ -649,10 +688,12 @@ test("non-Codex incremental responses are not reconstructed from native history"
 	const h = harness();
 	const c = context([], { id: "gpt-6.1-sol", provider: "openai", api: "openai-responses", promptCache: { short: 300 } });
 	const wire = paidBoundary();
-	const extra = { provider: "openai", api: "openai-responses",
+	const extra = {
+		provider: "openai", api: "openai-responses",
 		providerPayload: createOpenAIResponsesHistoryPayload("openai", [{
 			type: "message", role: "assistant", content: [{ type: "output_text", text: "Native non-Codex reply", annotations: [] }],
-		}]) };
+		}])
+	};
 	await h.emit("session_start", c);
 	await realRequest(h, c, payload(), nativeReply("response_non_codex_seed", undefined, usage(512), extra));
 	await realRequest(h, c, payload({ previous_response_id: "response_non_codex_seed" }),
@@ -663,8 +704,8 @@ test("non-Codex incremental responses are not reconstructed from native history"
 	await settle();
 	expect(wire.sends).toHaveLength(0);
 	expect(provider).not.toHaveBeenCalled();
-	expect(c.status).toMatch(/warm (?:pending|unavailable)/);
-	expect(c.status).not.toContain("warm off");
+	expect(c.status).toBeUndefined();
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm (?:pending|unavailable);/);
 	await h.emit("session_shutdown", c);
 });
 
@@ -691,7 +732,8 @@ test.each(["previous_response_id", "model", "type", "input"] as const)(
 		expect(wire.sends).toHaveLength(0);
 		expect(provider).not.toHaveBeenCalled();
 		expect(c.notifications.at(-1)).toContain("verified matching");
-		expect(c.status).not.toContain("warm off");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).not.toMatch(/^Cache warm off;/);
 		expect(delta).toEqual(finalDelta);
 		await h.emit("session_shutdown", c);
 	},
@@ -700,49 +742,50 @@ test.each(["previous_response_id", "model", "type", "input"] as const)(
 test.each(["error", "aborted", "unmatched-model", "unmatched-provider", "unmatched-api",
 	"session_switch", "session_branch", "session_tree", "session_compact", "session_shutdown",
 	"model", "provider", "api", "session"] as const)(
-	"%s discards the committed Codex baseline rather than accepting a later old-parent delta",
-	async action => {
-		const h = harness();
-		const c = context();
-		const wire = paidBoundary();
-		await h.emit("session_start", c);
-		await realRequest(h, c, payload(), nativeReply("response_seed", undefined, usage(512)));
-		if (action === "error" || action === "aborted" || action.startsWith("unmatched-")) {
-			const extra: Partial<AssistantMessage> = action === "error" || action === "aborted" ? { stopReason: action }
-				: action === "unmatched-model" ? { model: "gpt-other" }
-				: action === "unmatched-provider" ? { provider: "openai" } : { api: "openai-responses" };
-			await realRequest(h, c, payload(), nativeReply("response_not_committed", undefined, usage(2_048), extra));
-		} else if (action === "model" || action === "provider" || action === "api") {
-			const key = action === "model" ? "id" : action;
-			const original = c.model[key];
-			Object.assign(c.model, { [key]: `changed-${action}` });
-			c.tick();
-			Object.assign(c.model, { [key]: original });
-			c.tick();
-		} else if (action === "session") {
-			c.setSession("changed-session");
-			c.tick();
-			c.setSession("session-one");
-			c.tick();
-		} else {
-			await h.emit(action, c);
-			if (action === "session_shutdown") {
-				await h.emit("session_start", c);
-				await h.command(c, "on");
+		"%s discards the committed Codex baseline rather than accepting a later old-parent delta",
+		async action => {
+			const h = harness();
+			const c = context();
+			const wire = paidBoundary();
+			await h.emit("session_start", c);
+			await realRequest(h, c, payload(), nativeReply("response_seed", undefined, usage(512)));
+			if (action === "error" || action === "aborted" || action.startsWith("unmatched-")) {
+				const extra: Partial<AssistantMessage> = action === "error" || action === "aborted" ? { stopReason: action }
+					: action === "unmatched-model" ? { model: "gpt-other" }
+						: action === "unmatched-provider" ? { provider: "openai" } : { api: "openai-responses" };
+				await realRequest(h, c, payload(), nativeReply("response_not_committed", undefined, usage(2_048), extra));
+			} else if (action === "model" || action === "provider" || action === "api") {
+				const key = action === "model" ? "id" : action;
+				const original = c.model[key];
+				Object.assign(c.model, { [key]: `changed-${action}` });
+				c.tick();
+				Object.assign(c.model, { [key]: original });
+				c.tick();
+			} else if (action === "session") {
+				c.setSession("changed-session");
+				c.tick();
+				c.setSession("session-one");
+				c.tick();
+			} else {
+				await h.emit(action, c);
+				if (action === "session_shutdown") {
+					await h.emit("session_start", c);
+					await h.command(c, "on");
+				}
 			}
-		}
-		await realRequest(h, c, payload({ previous_response_id: "response_seed" }), nativeReply("response_old_parent_delta"));
-		clock.mockReturnValue(NOW + 1_800_000);
-		c.tick();
-		await h.command(c, "warm now");
-		await settle();
-		expect(wire.sends).toHaveLength(0);
-		expect(provider).not.toHaveBeenCalled();
-		expect(c.notifications.at(-1)).toContain("verified matching");
-		expect(c.status).not.toContain("warm off");
-		await h.emit("session_shutdown", c);
-	},
-);
+			await realRequest(h, c, payload({ previous_response_id: "response_seed" }), nativeReply("response_old_parent_delta"));
+			clock.mockReturnValue(NOW + 1_800_000);
+			c.tick();
+			await h.command(c, "warm now");
+			await settle();
+			expect(wire.sends).toHaveLength(0);
+			expect(provider).not.toHaveBeenCalled();
+			expect(c.notifications.at(-1)).toContain("verified matching");
+			expect(c.status).toBeUndefined();
+			expect(c.notifications.at(-1)).not.toMatch(/^Cache warm off;/);
+			await h.emit("session_shutdown", c);
+		},
+	);
 
 test.each(["no-payload", "empty-output", "dropped-item", "missing-response-id"] as const)(
 	"%s still warms the full request but cannot seed a guessed-text incremental chain",
@@ -772,10 +815,12 @@ test.each(["no-payload", "empty-output", "dropped-item", "missing-response-id"] 
 		expect(wire.sends).toHaveLength(1);
 		expect(wire.sends[0].input).toEqual(codexWarmInput(full.input as unknown[]));
 		expect(full).toEqual(finalFull);
-		wire.finish(warmReply({ responseId: "response_hidden_unusable", providerPayload:
-			createOpenAIResponsesHistoryPayload("openai-codex", [{
-				type: "message", role: "assistant", content: [{ type: "output_text", text: "Hidden raw reply", annotations: [] }],
-			}]) }));
+		wire.finish(warmReply({
+			responseId: "response_hidden_unusable", providerPayload:
+				createOpenAIResponsesHistoryPayload("openai-codex", [{
+					type: "message", role: "assistant", content: [{ type: "output_text", text: "Hidden raw reply", annotations: [] }],
+				}])
+		}));
 		await completion;
 		const deltaReply = nativeReply("response_unproven_delta");
 		await realRequest(h, c, payload({ previous_response_id: "response_without_replay" }), deltaReply);
@@ -785,7 +830,8 @@ test.each(["no-payload", "empty-output", "dropped-item", "missing-response-id"] 
 		await settle();
 		expect(wire.sends).toHaveLength(1);
 		expect(provider).toHaveBeenCalledTimes(1);
-		expect(c.status).not.toContain("warm off");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).not.toMatch(/^Cache warm off;/);
 		expect(c.notifications.at(-1)).toContain("verified matching");
 		expect(c.history).toEqual([first, deltaReply]);
 		await h.emit("session_shutdown", c);
@@ -793,7 +839,7 @@ test.each(["no-payload", "empty-output", "dropped-item", "missing-response-id"] 
 );
 
 test.each(["provider-error", "timeout", "missing-auth", "http-fallback", "long-text", "tool", "image", "no-usage"] as const)(
-	"%s disables warming without resetting expiry or starting a retry loop",
+	"%s pauses the snapshot without resetting expiry or starting a retry loop",
 	async scenario => {
 		const h = harness();
 		const c = context();
@@ -809,16 +855,19 @@ test.each(["provider-error", "timeout", "missing-auth", "http-fallback", "long-t
 		else if (scenario === "provider-error") wire.push({
 			type: "error", reason: "error", error: warmReply({ stopReason: "error", errorMessage: "Secret raw provider detail" }),
 		});
-		else if (scenario === "long-text") wire.push({ type: "text_delta", contentIndex: 0, delta: "x".repeat(65),
-			partial: warmReply({ content: [{ type: "text", text: "x".repeat(65) }] }) });
+		else if (scenario === "long-text") wire.push({
+			type: "text_delta", contentIndex: 0, delta: "x".repeat(65),
+			partial: warmReply({ content: [{ type: "text", text: "x".repeat(65) }] })
+		});
 		else if (scenario === "tool") wire.push({ type: "toolcall_start", contentIndex: 0, partial: warmReply() });
 		else if (scenario === "image") wire.finish(warmReply({ content: [{ type: "image", data: "private-image", mimeType: "image/png" }] }));
-		else if (scenario === "no-usage") wire.finish(warmReply({ usage: {
-			...warmReply().usage, input: 0, cacheRead: 0, totalTokens: 0,
-		} }));
+		else if (scenario === "no-usage") wire.finish(warmReply({
+			usage: {
+				...warmReply().usage, input: 0, cacheRead: 0, totalTokens: 0,
+			}
+		}));
 		await settle();
-		expect(c.status).toContain("warm off");
-		expect(c.status).toMatch(/~5:00\b/);
+		expect(c.status).toBe("~5:00");
 		expect(c.notifications.join(" ")).not.toMatch(/Secret|Raw provider|test-credential|Forbidden/);
 		const attempted = wire.sends.length;
 		clock.mockReturnValue(NOW + 7_200_000);
@@ -826,13 +875,69 @@ test.each(["provider-error", "timeout", "missing-auth", "http-fallback", "long-t
 		c.tick();
 		await settle();
 		expect(wire.sends).toHaveLength(attempted);
-		expect(c.status).toContain("~expired");
+		expect(c.status).toBeUndefined();
 		if (scenario === "http-fallback") expect(wire.sends).toHaveLength(0);
 		await h.command(c, "warm on");
-		expect(c.status).not.toContain("warm off");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).not.toMatch(/^Cache warm off;/);
 		await h.emit("session_shutdown", c);
 	},
 );
+
+test("native /cache autocomplete accepts full warm arguments and stops at terminal or unknown prefixes", async () => {
+	const h = harness();
+	const root = await mkdtemp(join(tmpdir(), "omp-cache-control-autocomplete-"));
+	try {
+		const autocomplete = new CombinedAutocompleteProvider(h.autocompleteCommands, root);
+		for (const [line, values, labels] of [
+			["/cache ", ["on", "off", "warm"], ["on", "off", "warm"]],
+			["/cache \t ", ["on", "off", "warm"], ["on", "off", "warm"]],
+			["/cache of", ["off"], ["off"]],
+			["/cache w", ["warm"], ["warm"]],
+			["/cache warm", ["warm"], ["warm"]],
+			["/cache warm ", ["warm on", "warm off", "warm now"], ["on", "off", "now"]],
+			["/cache warm n", ["warm now"], ["now"]],
+			["/cache \t warm \t n", ["warm now"], ["now"]],
+		] satisfies [string, string[], string[]][]) {
+			const suggestions = await autocomplete.getSuggestions([line], 0, line.length);
+			expect(suggestions).not.toBeNull();
+			expect(suggestions!.items.map(item => item.value)).toEqual(values);
+			expect(suggestions!.items.map(item => item.label)).toEqual(labels);
+			for (const [index, item] of suggestions!.items.entries()) {
+				expect(autocomplete.applyCompletion([line], 0, line.length, item, suggestions!.prefix)).toEqual({
+					lines: [`/cache ${values[index]}`], cursorLine: 0, cursorCol: `/cache ${values[index]}`.length,
+				});
+				expect(item.description).toBeTruthy();
+				if (["warm", "warm on", "warm now"].includes(item.value)) expect(item.description).toMatch(/paid/i);
+			}
+		}
+		for (const args of [
+			"on ", "off\t", "warm on ", "warm off ", "warm now\t",
+			"unknown", "Warm", "ON", "warm N", "warm never", "warm on now", "w ",
+		]) {
+			const line = `/cache ${args}`;
+			expect(await autocomplete.getSuggestions([line], 0, line.length)).toBeNull();
+		}
+		for (const [line, accepted, description] of [
+			["/cache w", "/cache warm", "Inspect or manage paid prefix refreshes"],
+			["/cache warm n", "/cache warm now", "Run a paid hidden prefix refresh now"],
+		]) {
+			const editor = new Editor(getEditorTheme());
+			editor.setAutocompleteProvider(autocomplete);
+			for (const character of line) editor.handleInput(character);
+			await settle();
+			expect(editor.isAutocompleteActive()).toBe(true);
+			expect(editor.render(120).join("\n")).toContain(description);
+			editor.handleInput("\t");
+			expect(editor.getText()).toBe(accepted);
+			expect(editor.isAutocompleteActive()).toBe(false);
+		}
+		expect(provider).not.toHaveBeenCalled();
+		expect(cacheHttp).not.toHaveBeenCalled();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
 
 test("manual controls work without data, reject invalid arguments, and preserve the warm-off preference", async () => {
 	const h = harness();
@@ -845,11 +950,15 @@ test("manual controls work without data, reject invalid arguments, and preserve 
 	await realRequest(h, c);
 	await h.command(c, "off");
 	await h.command(c, "on");
-	expect(c.status).toContain("warm off");
+	expect(c.status).toBe("~30:00");
+	await h.command(c, "warm");
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm off;/);
 	for (const action of ["warm never", "warm on now", "off extra"]) {
 		await h.command(c, action);
-		expect(c.status).toContain("warm off");
+		expect(c.status).toBe("~30:00");
 		expect(c.notifications.at(-1)).toContain("Usage:");
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm off;/);
 	}
 	clock.mockReturnValue(NOW + 2_000_000);
 	c.tick();
@@ -884,13 +993,14 @@ test("warm frames preserve the captured prefix/settings but use fresh transport 
 	await h.emit("assistant_message", c, { message });
 	c.history.push(message);
 	await h.emit("message_end", c, { message });
+	await h.emit("agent_end", c);
 	const completion = h.command(c, "warm now");
 	await settle();
 	expect(wire.sends).toHaveLength(1);
 	expect(wire.sends[0]).toMatchObject({
 		type: "response.create", input: [...(captured.input as unknown[]),
-			{ type: "configuration_update", reasoning: { effort: "low" } },
-			{ role: "user", content: [{ type: "input_text", text: "Reply with only: ok" }] }], instructions: "Final instructions.",
+		{ type: "configuration_update", reasoning: { effort: "low" } },
+		{ role: "user", content: [{ type: "input_text", text: "Reply with only: ok" }] }], instructions: "Final instructions.",
 		tools: captured.tools, reasoning: { effort: "high", summary: "auto" },
 		parallel_tool_calls: false, tool_choice: "none", prompt_cache_key: "native-cache-key",
 		client_metadata: { turn_id: "warm-turn", "x-codex-turn-metadata": "new-identity" },
@@ -911,53 +1021,79 @@ test("warm frames preserve the captured prefix/settings but use fresh transport 
 });
 
 test.each([
-	{ api: "anthropic-messages", provider: "anthropic", body: {
-		model: "cached-model", messages: [{ role: "user", content: [{ type: "text", text: "Actual prefix" }] }],
-		system: [{ type: "text", text: "Exact system" }], tools: [{ name: "read", input_schema: { type: "object" } }],
-		thinking: { type: "adaptive" }, output_config: { effort: "high" }, max_tokens: 8192,
-	}, cap: "max_tokens", output: 1 },
-	{ api: "bedrock-converse-stream", provider: "amazon-bedrock", body: {
-		messages: [{ role: "user", content: [{ text: "Actual prefix" }] }], system: [{ text: "Exact system" }],
-		toolConfig: { tools: [{ toolSpec: { name: "read", inputSchema: { json: { type: "object" } } } }] },
-		inferenceConfig: { maxTokens: 8192, temperature: 0.2 }, additionalModelRequestFields: { thinking: { type: "adaptive" } },
-	}, cap: "inferenceConfig.maxTokens", output: 1 },
-	{ api: "openai-responses", provider: "openai", body: {
-		model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], instructions: "Exact system",
-		tools: [{ type: "function", name: "read", parameters: { type: "object" } }],
-		reasoning: { effort: "high" }, prompt_cache_key: "same-key", max_output_tokens: 8192,
-	}, cap: "max_output_tokens", output: 16 },
-	{ api: "azure-openai-responses", provider: "azure-openai", body: {
-		model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], instructions: "Exact system",
-		reasoning: { effort: "high" }, max_output_tokens: 8192,
-	}, cap: "max_output_tokens", output: 16 },
-	{ api: "openai-completions", provider: "openrouter", body: {
-		model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }],
-		tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
-		reasoning_effort: "high", max_completion_tokens: 8192,
-	}, cap: "max_completion_tokens", output: 16 },
-	{ api: "openai-completions", provider: "openai", body: {
-		model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }], max_tokens: 8192,
-	}, cap: "max_tokens", output: 1 },
-	{ api: "google-generative-ai", provider: "google", body: {
-		model: "cached-model", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
-		config: { systemInstruction: "Exact system", tools: [{ functionDeclarations: [{ name: "read" }] }],
-			thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 8192 },
-	}, cap: "config.maxOutputTokens", output: 1 },
-	{ api: "google-vertex", provider: "google-vertex", body: {
-		model: "cached-model", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
-		config: { systemInstruction: "Exact system", maxOutputTokens: 8192 },
-	}, cap: "config.maxOutputTokens", output: 1 },
-	{ api: "google-gemini-cli", provider: "google-gemini-cli", body: {
-		model: "cached-model", project: "actual-project", requestId: "real-turn",
-		request: { contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }], systemInstruction: { parts: [{ text: "Exact system" }] },
-			generationConfig: { maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } } },
-	}, cap: "request.generationConfig.maxOutputTokens", output: 1 },
+	{
+		api: "anthropic-messages", provider: "anthropic", body: {
+			model: "cached-model", messages: [{ role: "user", content: [{ type: "text", text: "Actual prefix" }] }],
+			system: [{ type: "text", text: "Exact system" }], tools: [{ name: "read", input_schema: { type: "object" } }],
+			thinking: { type: "adaptive" }, output_config: { effort: "high" }, max_tokens: 8192,
+		}, cap: "max_tokens", output: 1
+	},
+	{
+		api: "bedrock-converse-stream", provider: "amazon-bedrock", body: {
+			messages: [{ role: "user", content: [{ text: "Actual prefix" }] }], system: [{ text: "Exact system" }],
+			toolConfig: { tools: [{ toolSpec: { name: "read", inputSchema: { json: { type: "object" } } } }] },
+			inferenceConfig: { maxTokens: 8192, temperature: 0.2 }, additionalModelRequestFields: { thinking: { type: "adaptive" } },
+		}, cap: "inferenceConfig.maxTokens", output: 1
+	},
+	{
+		api: "openai-responses", provider: "openai", body: {
+			model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], instructions: "Exact system",
+			tools: [{ type: "function", name: "read", parameters: { type: "object" } }],
+			reasoning: { effort: "high" }, prompt_cache_key: "same-key", max_output_tokens: 8192,
+		}, cap: "max_output_tokens", output: 16
+	},
+	{
+		api: "azure-openai-responses", provider: "azure-openai", body: {
+			model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], instructions: "Exact system",
+			reasoning: { effort: "high" }, max_output_tokens: 8192,
+		}, cap: "max_output_tokens", output: 16
+	},
+	{
+		api: "openai-completions", provider: "openrouter", body: {
+			model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }],
+			tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
+			reasoning_effort: "high", max_completion_tokens: 8192,
+		}, cap: "max_completion_tokens", output: 16
+	},
+	{
+		api: "openai-completions", provider: "openai", body: {
+			model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }], max_tokens: 8192,
+		}, cap: "max_tokens", output: 1
+	},
+	{
+		api: "google-generative-ai", provider: "google", body: {
+			model: "cached-model", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
+			config: {
+				systemInstruction: "Exact system", tools: [{ functionDeclarations: [{ name: "read" }] }],
+				thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 8192
+			},
+		}, cap: "config.maxOutputTokens", output: 1
+	},
+	{
+		api: "google-vertex", provider: "google-vertex", body: {
+			model: "cached-model", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
+			config: { systemInstruction: "Exact system", maxOutputTokens: 8192 },
+		}, cap: "config.maxOutputTokens", output: 1
+	},
+	{
+		api: "google-gemini-cli", provider: "google-gemini-cli", body: {
+			model: "cached-model", project: "actual-project", requestId: "real-turn",
+			request: {
+				contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }], systemInstruction: { parts: [{ text: "Exact system" }] },
+				generationConfig: { maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } }
+			},
+		}, cap: "request.generationConfig.maxOutputTokens", output: 1
+	},
 	// Antigravity's wire model is a thinking-level variant of the selected model.
-	{ api: "google-gemini-cli", provider: "google-antigravity", body: {
-		model: "cached-model-high", project: "actual-project", requestId: "real-turn", userAgent: "antigravity",
-		request: { contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }], systemInstruction: { parts: [{ text: "Exact system" }] },
-			generationConfig: { maxOutputTokens: 65536, thinkingConfig: { thinkingLevel: "high" } } },
-	}, cap: "request.generationConfig.maxOutputTokens", output: 1 },
+	{
+		api: "google-gemini-cli", provider: "google-antigravity", body: {
+			model: "cached-model-high", project: "actual-project", requestId: "real-turn", userAgent: "antigravity",
+			request: {
+				contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }], systemInstruction: { parts: [{ text: "Exact system" }] },
+				generationConfig: { maxOutputTokens: 65536, thinkingConfig: { thinkingLevel: "high" } }
+			},
+		}, cap: "request.generationConfig.maxOutputTokens", output: 1
+	},
 ] satisfies { api: string; provider: string; body: Record<string, unknown>; cap: string; output: number }[])(
 	"$api heats proven sub-1024 cache prefixes on an inferred cadence without changing history or reasoning",
 	async ({ api, provider: providerName, body, cap, output }: {
@@ -972,8 +1108,7 @@ test.each([
 		await realRequest(h, c, structuredClone(body), assistant(foregroundUsage, {
 			provider: providerName, model: "cached-model", api: api as AssistantMessage["api"], timestamp: NOW,
 		}));
-		expect(c.status).toMatch(/\b98%/);
-		expect(c.status).toContain("ttl ?");
+		expect(c.status).toBeUndefined();
 		clock.mockReturnValue(NOW + 239_999);
 		c.tick();
 		await settle();
@@ -1003,10 +1138,9 @@ test.each([
 		if (output) wire.push({ type: "text_delta", contentIndex: 0, delta: "Hidden", partial: reply });
 		wire.finish(reply);
 		await settle();
-		expect(c.status).toMatch(/\b98%/);
-		expect(c.status).toContain("ttl ?");
-		expect(c.status).not.toMatch(/~\d/);
+		expect(c.status).toBeUndefined();
 		expect(c.history).toHaveLength(1);
+		expect(c.history[0].usage).toEqual(usage(12, 500));
 		await h.command(c, "warm");
 		expect(c.notifications.at(-1)).toMatch(/next in 4:00.*1 calls.*inferred.*TTL remains unknown/);
 		expect(c.notifications.join(" ")).not.toContain("Hidden bounded output");
@@ -1031,10 +1165,15 @@ test.each([
 	const h = harness();
 	const c = context([], { id: "claude-fable", provider: "anthropic", api: "anthropic-messages" });
 	const wire = paidBoundary({});
-	const body = { model: "claude-fable", max_tokens: 8192, thinking: { type: "adaptive" },
-		output_config: { effort: "high" }, messages: [{ role: "user", content: [
-			{ type: "text", text: "Actual prefix", cache_control: { type: "ephemeral", ttl } },
-		] }] };
+	const body = {
+		model: "claude-fable", max_tokens: 8192, thinking: { type: "adaptive" },
+		output_config: { effort: "high", task_budget: { type: "tokens", total: 20_000 } },
+		context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] }, messages: [{
+			role: "user", content: [
+				{ type: "text", text: "Actual prefix", cache_control: { type: "ephemeral", ttl } },
+			]
+		}]
+	};
 	await h.emit("session_start", c);
 	await realRequest(h, c, body, assistant(usage(12, 500), {
 		model: "claude-fable", provider: "anthropic", api: "anthropic-messages", timestamp: NOW,
@@ -1048,10 +1187,12 @@ test.each([
 	await settle();
 	expect(wire.sends).toHaveLength(1);
 	expect(wire.sends[0]).toMatchObject({ max_tokens: 1, thinking: { type: "adaptive" }, output_config: { effort: "high" } });
+	// The empty warm context drops native body-derived betas; without them Anthropic answers HTTP 400.
+	expect(wire.options[0]).toMatchObject({ betas: ["context-management-2025-06-27", "effort-2025-11-24", "task-budgets-2026-03-13"] });
 	wire.finish(warmReply({ provider: "anthropic", model: "claude-fable", api: "anthropic-messages", stopReason: "length" }));
 	await settle();
-	expect(c.status).toContain(countdown);
-	expect(c.status).toMatch(/\b98%/);
+	expect(c.status).toBe(countdown);
+	expect(c.history[0].usage).toEqual(usage(12, 500));
 	await h.emit("session_shutdown", c);
 });
 
@@ -1062,14 +1203,16 @@ test.each(["cacheless", "budget-thinking", "invalid-explicit-cache", "unsupporte
 		const model: Model = {
 			id: "other-model", provider: "other-provider", api: reason === "unsupported-api" ? "ollama"
 				: reason === "budget-thinking" ? "anthropic-messages"
-				: reason === "invalid-explicit-cache" ? "google-generative-ai" : "openai-completions",
+					: reason === "invalid-explicit-cache" ? "google-generative-ai" : "openai-completions",
 		};
 		const c = context([], model);
 		const wire = paidBoundary({});
 		const body = reason === "invalid-explicit-cache"
 			? { model: model.id, contents: [{ role: "user", parts: [{ text: "Real request" }] }], config: { cachedContent: "../../unsafe", maxOutputTokens: 8192 } }
-			: { model: model.id, messages: [{ role: "user", content: "Real request" }], max_tokens: 8192,
-				...(reason === "budget-thinking" ? { thinking: { type: "enabled", budget_tokens: 4096 } } : {}) };
+			: {
+				model: model.id, messages: [{ role: "user", content: "Real request" }], max_tokens: 8192,
+				...(reason === "budget-thinking" ? { thinking: { type: "enabled", budget_tokens: 4096 } } : {})
+			};
 		await h.emit("session_start", c);
 		await realRequest(h, c, body, assistant(usage(2_048, reason === "cacheless" ? 0 : 2_048), {
 			model: model.id, provider: model.provider, api: model.api as AssistantMessage["api"], timestamp: NOW,
@@ -1079,7 +1222,7 @@ test.each(["cacheless", "budget-thinking", "invalid-explicit-cache", "unsupporte
 		await h.command(c, "warm now");
 		await settle();
 		expect(wire.sends).toHaveLength(0);
-		expect(c.status).toContain("warm unavailable");
+		expect(c.status).toBeUndefined();
 		expect(c.notifications.at(-1)).toMatch(/unavailable.*0 calls.*Unavailable:/);
 		await h.emit("session_shutdown", c);
 	},
@@ -1117,10 +1260,14 @@ test("Gemini upkeep replaces old SDK auth/abort metadata without changing cache-
 	const old = new AbortController();
 	old.abort();
 	const wire = paidBoundary({ config: { httpOptions: { headers: { Authorization: "fresh-test-auth" } } } });
-	const body = { model: "gemini-cached", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
-		config: { systemInstruction: "Actual system", tools: [{ functionDeclarations: [{ name: "read" }] }],
+	const body = {
+		model: "gemini-cached", contents: [{ role: "user", parts: [{ text: "Actual prefix" }] }],
+		config: {
+			systemInstruction: "Actual system", tools: [{ functionDeclarations: [{ name: "read" }] }],
 			thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 8192,
-			abortSignal: old.signal, httpOptions: { headers: { Authorization: "old-test-auth" } } } };
+			abortSignal: old.signal, httpOptions: { headers: { Authorization: "old-test-auth" } }
+		}
+	};
 	await h.emit("session_start", c);
 	await realRequest(h, c, body, assistant(usage(12, 500), {
 		model: "gemini-cached", provider: "google", api: "google-generative-ai", timestamp: NOW,
@@ -1144,22 +1291,22 @@ test("per-request totals include writes, exclude output, and replace rather than
 	const h = harness();
 	const c = context([assistant(usage(4, 3, 3))]);
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(/\b30%/);
-	expect(c.status).toContain("ttl ?");
+	expect(c.status).toBeUndefined();
+	c.history.push(assistant(usage(100, 200, 724)));
+	await h.emit("agent_end", c);
+	expect(c.status).toBe("~29:50");
 	c.history.push(assistant(usage(100, 200, 700)));
 	await h.emit("agent_end", c);
-	expect(c.status).toMatch(/\b20%/);
+	expect(c.status).toBeUndefined();
 });
 
-test("zero reported input is no usage, while writes without reads report zero reuse", async () => {
+test("zero reported input hides the countdown, while sufficient writes need no reads", async () => {
 	const h = harness();
 	const c = context([assistant()]);
 	await h.emit("session_start", c);
-	expect(c.status).toBeDefined();
-	expect(c.status).not.toMatch(/\d+%|ttl|~/);
-	await h.emit("message_end", c, { message: assistant(usage(100, 0, 300)) });
-	expect(c.status).toMatch(/\b0%/);
-	expect(c.status).toContain("ttl ?");
+	expect(c.status).toBeUndefined();
+	await h.emit("message_end", c, { message: assistant(usage(100, 0, 924)) });
+	expect(c.status).toBe("~29:50");
 });
 
 test("Sol's 30-minute assumption starts at send time, not response completion", async () => {
@@ -1168,13 +1315,13 @@ test("Sol's 30-minute assumption starts at send time, not response completion", 
 		timestamp: NOW - 120_000, completedAt: NOW - 10_000, duration: 110_000,
 	})]);
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(/~28:00\b/);
+	expect(c.status).toBe("~28:00");
 	clock.mockReturnValue(NOW + 1_679_000);
 	c.tick();
-	expect(c.status).toMatch(/~0:01\b/);
+	expect(c.status).toBe("~0:01");
 	clock.mockReturnValue(NOW + 1_680_000);
 	c.tick();
-	expect(c.status).toMatch(/~expired/);
+	expect(c.status).toBeUndefined();
 });
 
 test.each([
@@ -1190,9 +1337,10 @@ test.each([
 		const message = assistant(tokens, extra);
 		const c = context([message], { id: message.model, provider: message.provider });
 		await h.emit("session_start", c);
+		expect(c.status).toBeUndefined();
 		clock.mockReturnValue(NOW + 7_200_000);
 		c.tick();
-		expect(c.status).toMatch(/ttl \?/);
+		expect(c.status).toBeUndefined();
 	},
 );
 
@@ -1207,13 +1355,13 @@ test.each([
 		timestamp: NOW - 12_000, duration: 10_000,
 	})], { provider: "anthropic", id: "claude", promptCache: { [ttl]: seconds } });
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(new RegExp(`~${left}\\b`));
+	expect(c.status).toBe(`~${left}`);
 	clock.mockReturnValue(NOW + seconds * 1_000 - 13_000);
 	c.tick();
-	expect(c.status).toMatch(/~0:01\b/);
+	expect(c.status).toBe("~0:01");
 	clock.mockReturnValue(NOW + seconds * 1_000 - 12_000);
 	c.tick();
-	expect(c.status).toMatch(/~expired/);
+	expect(c.status).toBeUndefined();
 });
 
 test("ambiguous tiers and missing send timing do not imply expiry", async () => {
@@ -1232,26 +1380,25 @@ test("ambiguous tiers and missing send timing do not imply expiry", async () => 
 		}),
 	]) {
 		await h.emit("message_end", c, { message });
-		expect(c.status).toMatch(/ttl \?/);
+		expect(c.status).toBeUndefined();
 	}
 });
 
-test("session changes discard old metrics and tear down the old context timer", async () => {
+test("session changes discard old countdowns and tear down the old context timer", async () => {
 	const h = harness();
-	const old = context([assistant(usage(100, 600, 300))]);
+	const old = context([assistant(usage(100, 600, 324))]);
 	const fresh = context([], undefined, old.display);
 	await h.emit("session_start", old);
-	expect(old.status).toMatch(/\b60%/);
+	expect(old.status).toBe("~29:50");
 	expect(old.timers.size).toBe(1);
 	await h.emit("session_switch", fresh);
 	expect(old.timers.size).toBe(0);
 	expect(fresh.timers.size).toBe(1);
-	expect(fresh.status).toBeDefined();
-	expect(fresh.status).not.toMatch(/\d+%|ttl|~/);
-	fresh.history.push(assistant(usage(75, 25, 0)));
+	expect(fresh.status).toBeUndefined();
+	fresh.history.push(assistant(usage(75, 25, 924), { timestamp: NOW - 120_000 }));
 	for (const event of ["session_branch", "session_tree", "session_compact"]) {
 		await h.emit(event, fresh);
-		expect(fresh.status).toMatch(/\b25%/);
+		expect(fresh.status).toBe("~28:00");
 		expect(fresh.timers.size).toBe(1);
 		expect(old.timers.size).toBe(0);
 	}
@@ -1260,19 +1407,19 @@ test("session changes discard old metrics and tear down the old context timer", 
 	expect(fresh.status).toBeUndefined();
 });
 
-test("bare and on commands show native cache status; off keeps it hidden through later hooks", async () => {
+test("bare and on commands show the countdown; off keeps it hidden through later hooks", async () => {
 	const h = harness();
-	const c = context([assistant(usage(100, 600, 300))]);
+	const c = context([assistant(usage(100, 600, 324))]);
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(/\b60%/);
+	expect(c.status).toBe("~29:50");
 	for (const action of ["", "", "on", "on"]) {
 		await h.command(c, action);
-		expect(c.status).toMatch(/\b60%/);
+		expect(c.status).toBe("~29:50");
 		expect(c.timers.size).toBe(1);
 	}
 	await h.command(c, "off");
 	expect(c.status).toBeUndefined();
-	c.history.push(assistant(usage(50, 50, 0)));
+	c.history.push(assistant(usage(50, 50, 924), { timestamp: NOW - 60_000 }));
 	await h.emit("message_end", c, { message: c.history[c.history.length - 1] });
 	await h.emit("turn_end", c);
 	c.tick();
@@ -1280,7 +1427,7 @@ test("bare and on commands show native cache status; off keeps it hidden through
 	expect(c.timers.size).toBe(0);
 	for (const action of ["", "on"]) {
 		await h.command(c, action);
-		expect(c.status).toMatch(/\b50%/);
+		expect(c.status).toBe("~29:00");
 		expect(c.timers.size).toBe(1);
 		await h.command(c, "off");
 		expect(c.status).toBeUndefined();
@@ -1289,61 +1436,53 @@ test("bare and on commands show native cache status; off keeps it hidden through
 	expect(c.notifications).toEqual([]);
 });
 
-test("message events render immediately while settled metrics come from session history", async () => {
+test("message events render immediately while settled countdowns come from session history", async () => {
 	const h = harness();
-	const c = context([assistant(usage(100, 600, 300))]);
+	const c = context([assistant(usage(100, 600, 324))]);
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(/\b60%/);
-	await h.emit("message_end", c, { message: assistant(usage(10, 90, 0)) });
-	expect(c.status).toMatch(/\b90%/);
+	expect(c.status).toBe("~29:50");
+	await h.emit("message_end", c, { message: assistant(usage(10, 90, 924), { timestamp: NOW - 60_000 }) });
+	expect(c.status).toBe("~29:00");
 	await h.emit("turn_end", c);
-	expect(c.status).toMatch(/\b60%/);
-	c.history.push(assistant(usage(75, 25, 0)));
+	expect(c.status).toBe("~29:50");
+	c.history.push(assistant(usage(75, 25, 924), { timestamp: NOW - 120_000 }));
 	await h.emit("agent_end", c);
-	expect(c.status).toMatch(/\b25%/);
+	expect(c.status).toBe("~28:00");
 });
 
-test("timer repaint follows current model without borrowing another model's metrics", async () => {
+test("timer repaint follows current model without borrowing another model's countdown", async () => {
 	const h = harness();
-	const c = context([assistant(usage(100, 600, 300))]);
+	const c = context([assistant(usage(100, 600, 324))]);
 	await h.emit("session_start", c);
 	c.model.id = "gpt-other";
 	c.tick();
-	expect(c.status).toBeDefined();
-	expect(c.status).not.toMatch(/\d+%|ttl|~/);
+	expect(c.status).toBeUndefined();
 	c.model.id = "gpt-6.1-sol";
 	c.tick();
-	expect(c.status).toMatch(/\b60%/);
+	expect(c.status).toBe("~29:50");
 	expect(c.timers.size).toBe(1);
 });
 
-test.each(["unicode", "nerd"] as const)("live %s-to-ASCII switch preserves cache metrics and controls", async preset => {
+test.each(["unicode", "nerd"] as const)("live %s-to-ASCII switch leaves countdowns and controls unchanged", async preset => {
 	const h = harness();
 	const c = context([assistant(usage(256, 512, 256))]);
 	c.display.setSymbolPreset(preset);
 	await h.emit("session_start", c);
-	expect(c.status).toMatch(/\b50%/);
-	expect(c.status).toMatch(/~29:50\b/);
+	expect(c.status).toBe("~29:50");
 
 	c.display.setSymbolPreset("ascii");
 	c.tick();
-	expect(c.status).toMatch(/^[\x00-\x7F]+$/);
-	expect(c.status).toMatch(/\b50%/);
-	expect(c.status).toMatch(/~29:50\b/);
+	expect(c.status).toBe("~29:50");
 	await h.command(c, "off");
 	expect(c.status).toBeUndefined();
 	await h.command(c, "on");
-	expect(c.status).toMatch(/^[\x00-\x7F]+$/);
-	expect(c.status).toMatch(/\b50%/);
+	expect(c.status).toBe("~29:50");
 
 	c.history.length = 0;
 	await h.emit("session_switch", c);
-	expect(c.status).toMatch(/^[\x00-\x7F]+$/);
-	expect(c.status).not.toMatch(/\d+%|ttl|~/);
+	expect(c.status).toBeUndefined();
 	await h.emit("message_end", c, { message: assistant(usage(100, 200, 700)) });
-	expect(c.status).toMatch(/^[\x00-\x7F]+$/);
-	expect(c.status).toMatch(/\b20%/);
-	expect(c.status).toContain("ttl ?");
+	expect(c.status).toBeUndefined();
 });
 
 
@@ -1359,8 +1498,10 @@ test("explicit Gemini renewals preserve the chosen storage duration and foregrou
 			expiry = NOW + 6_840_000;
 			return Response.json({ name, expireTime: new Date(expiry).toISOString() });
 		}
-		return Response.json({ name, model: "models/gemini-cached", expireTime: new Date(expiry).toISOString(),
-			updateTime: new Date(expiry - 3_600_000).toISOString() });
+		return Response.json({
+			name, model: "models/gemini-cached", expireTime: new Date(expiry).toISOString(),
+			updateTime: new Date(expiry - 3_600_000).toISOString()
+		});
 	}));
 	const body = { model: "gemini-cached", contents: [], config: { cachedContent: name, maxOutputTokens: 8192 } };
 	const foregroundReply = () => assistant(usage(12, 500), {
@@ -1372,13 +1513,13 @@ test("explicit Gemini renewals preserve the chosen storage duration and foregrou
 	await settle();
 	expect(requests).toHaveLength(1);
 	expect(requests[0].url).toBe("https://generativelanguage.googleapis.com/v1beta/cachedContents/existing-native-cache");
-	expect(c.status).toContain("~60:00");
+	expect(c.status).toBe("~60:00");
 	clock.mockReturnValue(NOW + 3_000_000);
 	await realRequest(h, c, body, foregroundReply());
 	c.tick();
 	await settle();
 	expect(requests).toHaveLength(2);
-	expect(c.status).toContain("~10:00");
+	expect(c.status).toBe("~10:00");
 	clock.mockReturnValue(NOW + 3_239_999);
 	c.tick();
 	await settle();
@@ -1390,10 +1531,10 @@ test("explicit Gemini renewals preserve the chosen storage duration and foregrou
 	expect(requests[3].init?.method).toBe("PATCH");
 	expect(requests[3].url).toContain("?updateMask=ttl");
 	expect(requests[3].init?.body).toBe('{"ttl":"3600s"}');
-	expect(c.status).toContain("~60:00");
-	expect(c.status).toMatch(/\b98%/);
+	expect(c.status).toBe("~60:00");
 	expect(provider).not.toHaveBeenCalled();
 	expect(c.history).toHaveLength(2);
+	expect(c.history.map(message => message.usage)).toEqual([usage(12, 500), usage(12, 500)]);
 	await h.command(c, "warm");
 	expect(c.notifications.at(-1)).toMatch(/1 calls.*\$0\.000000.*1 unpriced.*storage extension is billed.*price is unavailable/);
 	await h.emit("session_shutdown", c);
@@ -1413,8 +1554,10 @@ test("Vertex explicit-cache upkeep delegates ambient auth and uses the native re
 		requests.push({ url: String(url), init });
 		return Response.json(init?.method === "PATCH"
 			? { name, expireTime: new Date(NOW + 1_200_000).toISOString() }
-			: { name, model: "projects/native-project/locations/us-central1/publishers/google/models/gemini-cached",
-				expireTime: new Date(NOW + 600_000).toISOString(), createTime: new Date(NOW - 600_000).toISOString() });
+			: {
+				name, model: "projects/native-project/locations/us-central1/publishers/google/models/gemini-cached",
+				expireTime: new Date(NOW + 600_000).toISOString(), createTime: new Date(NOW - 600_000).toISOString()
+			});
 	}));
 	await h.emit("session_start", c);
 	await realRequest(h, c, { model: "gemini-cached", contents: [], config: { cachedContent: name } }, assistant(usage(12, 500), {
@@ -1427,7 +1570,7 @@ test("Vertex explicit-cache upkeep delegates ambient auth and uses the native re
 	expect(new Headers(requests[0].init?.headers).get("Authorization")).toBe("Bearer native-test-access");
 	expect(new Headers(requests[0].init?.headers).get("X-Custom")).toBe("native-header");
 	expect(requests[1].init?.body).toBe('{"ttl":"1200s"}');
-	expect(c.status).toContain("~20:00");
+	expect(c.status).toBe("~20:00");
 	expect(c.notifications.join(" ")).not.toContain("native-test-access");
 	expect(provider).not.toHaveBeenCalled();
 	await h.emit("session_shutdown", c);
@@ -1440,13 +1583,15 @@ test.each([
 	const h = harness();
 	const c = context([], { id: "gemini-cached", provider: "google", api: "google-generative-ai" });
 	const name = "cachedContents/native-cache";
-	let release: (response: Response) => void = () => {};
+	let release: (response: Response) => void = () => { };
 	const requests: RequestInit[] = [];
 	cacheHttp.mockImplementation(isolatedFetch(async (_url, init = {}) => {
 		requests.push(init);
 		if ((init.method ?? "GET") === stage) return new Promise<Response>(resolve => { release = resolve; });
-		return Response.json({ name, model: "models/gemini-cached", expireTime: new Date(NOW + 30_000).toISOString(),
-			updateTime: new Date(NOW - 3_570_000).toISOString() });
+		return Response.json({
+			name, model: "models/gemini-cached", expireTime: new Date(NOW + 30_000).toISOString(),
+			updateTime: new Date(NOW - 3_570_000).toISOString()
+		});
 	}));
 	await h.emit("session_start", c);
 	await realRequest(h, c, { model: "gemini-cached", contents: [], config: { cachedContent: name } }, assistant(usage(12, 500), {
@@ -1458,12 +1603,14 @@ test.each([
 	else if (action === "off") await h.command(c, "off");
 	else await h.emit("session_shutdown", c);
 	expect(requests.at(-1)?.signal?.aborted).toBe(true);
-	release(Response.json({ name, model: "models/gemini-cached", expireTime: new Date(NOW + 3_600_000).toISOString(),
-		updateTime: new Date(NOW).toISOString() }));
+	release(Response.json({
+		name, model: "models/gemini-cached", expireTime: new Date(NOW + 3_600_000).toISOString(),
+		updateTime: new Date(NOW).toISOString()
+	}));
 	await completion;
 	await settle();
 	expect(requests.filter(request => request.method === "PATCH")).toHaveLength(stage === "PATCH" ? 1 : 0);
-	expect(c.status ?? "").not.toContain("~60:00");
+	expect(c.status).toBeUndefined();
 	expect(provider).not.toHaveBeenCalled();
 	await h.emit("session_shutdown", c);
 });
@@ -1480,17 +1627,18 @@ test.each(["metadata-error", "invalid-retention", "unchanged-expiry", "wrong-res
 				name: reason === "wrong-resource" ? "cachedContents/different-resource" : name,
 				expireTime: new Date(NOW + 30_000).toISOString(),
 			});
-			return Response.json({ name, model: "models/gemini-cached",
+			return Response.json({
+				name, model: "models/gemini-cached",
 				expireTime: new Date(NOW + 30_000).toISOString(),
-				updateTime: reason === "invalid-retention" ? "not-a-timestamp" : new Date(NOW - 3_570_000).toISOString() });
+				updateTime: reason === "invalid-retention" ? "not-a-timestamp" : new Date(NOW - 3_570_000).toISOString()
+			});
 		}));
 		await h.emit("session_start", c);
 		await realRequest(h, c, { model: "gemini-cached", contents: [], config: { cachedContent: name } }, assistant(usage(12, 500), {
 			model: "gemini-cached", provider: "google", api: "google-generative-ai", timestamp: NOW,
 		}));
 		await h.command(c, "warm now");
-		expect(c.status).toContain("warm off");
-		expect(c.status).toContain("ttl ?");
+		expect(c.status).toBeUndefined();
 		expect(c.notifications.join(" ")).not.toContain("Secret raw provider error");
 		const charged = cacheHttp.mock.calls.length;
 		clock.mockReturnValue(NOW + 7_200_000);
@@ -1508,9 +1656,11 @@ test.each([undefined, "30m", -1] as const)("Ollama keeps the exact prefix and %s
 	const c = context([], { id: "local-model", provider: "ollama", api: "ollama-chat" });
 	c.setAuth(async () => undefined);
 	const wire = paidBoundary({});
-	const body = { model: "local-model", messages: [{ role: "user", content: "Real KV-cache prefix" }], stream: true,
+	const body = {
+		model: "local-model", messages: [{ role: "user", content: "Real KV-cache prefix" }], stream: true,
 		think: true, options: { num_predict: 8192, temperature: 0.2 },
-		...(keepAlive === undefined ? {} : { keep_alive: keepAlive }) };
+		...(keepAlive === undefined ? {} : { keep_alive: keepAlive })
+	};
 	await h.emit("session_start", c);
 	await realRequest(h, c, body, assistant(usage(500), {
 		model: "local-model", provider: "ollama", api: "ollama-chat", timestamp: NOW,
@@ -1523,15 +1673,17 @@ test.each([undefined, "30m", -1] as const)("Ollama keeps the exact prefix and %s
 	expect(wire.sends[0].messages).toEqual([{ role: "user", content: "Real KV-cache prefix" }]);
 	expect(wire.sends[0].think).toBe(true);
 	expect(wire.sends[0].keep_alive).toBe(keepAlive);
-	const reply = warmReply({ model: "local-model", provider: "ollama", api: "ollama-chat",
+	const reply = warmReply({
+		model: "local-model", provider: "ollama", api: "ollama-chat",
 		content: [{ type: "thinking", thinking: "Hidden thought" }], stopReason: "length",
-		usage: { ...warmReply().usage, input: 500, output: 1, cacheRead: 0, totalTokens: 501 } });
+		usage: { ...warmReply().usage, input: 500, output: 1, cacheRead: 0, totalTokens: 501 }
+	});
 	wire.push({ type: "thinking_delta", contentIndex: 0, delta: "Hidden thought", partial: reply });
 	wire.finish(reply);
 	await settle();
-	expect(c.status).toContain("ttl ?");
-	expect(c.status).toContain("warm miss");
-	expect(c.status).not.toContain("warm off");
+	expect(c.status).toBeUndefined();
+	await h.command(c, "warm");
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm miss; next in /);
 	expect(c.history).toHaveLength(1);
 	await h.command(c, "off");
 	clock.mockReturnValue(NOW + 480_000);
@@ -1541,7 +1693,7 @@ test.each([undefined, "30m", -1] as const)("Ollama keeps the exact prefix and %s
 	await h.emit("session_shutdown", c);
 });
 
-test("a continuing foreground provider request aborts upkeep before its new prefix can be confused with stale success", async () => {
+test("a new foreground turn aborts upkeep before its new prefix can be confused with stale success", async () => {
 	const h = harness();
 	const c = context();
 	const wire = paidBoundary();
@@ -1552,17 +1704,20 @@ test("a continuing foreground provider request aborts upkeep before its new pref
 	await h.emit("assistant_message", c, { message: first });
 	c.history.push(first);
 	await h.emit("message_end", c, { message: first });
+	await h.emit("agent_end", c);
 	clock.mockReturnValue(NOW + 1_500_000);
 	const completion = h.command(c, "warm now");
 	await settle();
 	expect(wire.sends).toHaveLength(1);
+	await h.emit("before_agent_start", c);
 	await h.emit("before_provider_request", c, { payload: payload({ input: [{ role: "user", content: "Continued real prefix" }] }) });
 	expect(wire.signals[0].aborted).toBe(true);
 	wire.finish();
 	await completion;
-	expect(c.status).toMatch(/~5:00\b/);
-	expect(c.status).toMatch(/\b94%/);
-	expect(c.status).toContain("warm pending");
+	expect(c.status).toBe("~5:00");
+	expect(c.history[0].usage).toEqual(usage(128, 1_920));
+	await h.command(c, "warm");
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm pending;/);
 	clock.mockReturnValue(NOW + 3_000_000);
 	c.tick();
 	await settle();
@@ -1584,13 +1739,19 @@ test("explicit cache requests resolve live native headers instead of reusing a f
 	const requests: RequestInit[] = [];
 	cacheHttp.mockImplementation(isolatedFetch(async (_url, init) => {
 		requests.push(init ?? {});
-		return Response.json({ name, model: "models/gemini-cached",
-			expireTime: new Date(NOW + 3_600_000).toISOString(), updateTime: new Date(NOW).toISOString() });
+		return Response.json({
+			name, model: "models/gemini-cached",
+			expireTime: new Date(NOW + 3_600_000).toISOString(), updateTime: new Date(NOW).toISOString()
+		});
 	}));
 	await h.emit("session_start", c);
 	await h.emit("before_agent_start", c);
-	await h.emit("before_provider_request", bound, { payload: { model: "gemini-cached", contents: [],
-		config: { cachedContent: name, maxOutputTokens: 8192 } } });
+	await h.emit("before_provider_request", bound, {
+		payload: {
+			model: "gemini-cached", contents: [],
+			config: { cachedContent: name, maxOutputTokens: 8192 }
+		}
+	});
 	const message = assistant(usage(12, 500), { model: "gemini-cached", provider: "google", api: "google-generative-ai", timestamp: NOW });
 	await h.emit("assistant_message", c, { message });
 	c.history.push(message);
@@ -1603,7 +1764,7 @@ test("explicit cache requests resolve live native headers instead of reusing a f
 	expect(new Headers(requests[0].headers).get("x-goog-api-key")).toBe("test-credential");
 	expect(headerSignals).toHaveLength(1);
 	expect(headerSignals[0]?.aborted).toBe(false);
-	expect(c.status).toContain("~60:00");
+	expect(c.status).toBe("~60:00");
 	expect(c.notifications.join(" ")).not.toMatch(/fresh-native-value|expired-bound-value/);
 	await h.emit("session_shutdown", c);
 });
@@ -1649,18 +1810,21 @@ test.each([
 	const h = harness();
 	const c = context([], { id: "local-model", provider: "ollama", api: "ollama-chat" });
 	const wire = paidBoundary({});
-	const body: Record<string, unknown> = { model: "local-model", messages: [{ role: "user", content: "Actual local prefix" }],
-		options: { num_predict: 8192 }, ...(policy === undefined ? {} : { keep_alive: policy }) };
+	const body: Record<string, unknown> = {
+		model: "local-model", messages: [{ role: "user", content: "Actual local prefix" }],
+		options: { num_predict: 8192 }, ...(policy === undefined ? {} : { keep_alive: policy })
+	};
 	await h.emit("session_start", c);
 	await realRequest(h, c, body, assistant(usage(500), { model: "local-model", provider: "ollama", api: "ollama-chat", timestamp: NOW }));
-	expect(c.status).toContain("ttl ?");
+	expect(c.status).toBeUndefined();
 	if (deadline === undefined) {
 		clock.mockReturnValue(NOW + 3_600_000);
 		c.tick();
 		await settle();
 		await h.command(c, "warm now");
 		expect(wire.sends).toHaveLength(0);
-		expect(c.status).toContain("warm unavailable");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm unavailable;/);
 		expect(c.notifications.at(-1)).toMatch(/zero native residency|too short.*one-second/);
 	} else {
 		clock.mockReturnValue(NOW + deadline - 1);
@@ -1674,9 +1838,11 @@ test.each([
 		expect(wire.sends[0].keep_alive).toBe(policy);
 		expect(wire.sends[0].messages).toEqual(body.messages);
 		expect(wire.sends[0].options).toEqual({ num_predict: 1 });
-		wire.finish(warmReply({ model: "local-model", provider: "ollama", api: "ollama-chat",
+		wire.finish(warmReply({
+			model: "local-model", provider: "ollama", api: "ollama-chat",
 			stopReason: "length", content: [{ type: "text", text: "Discarded local output" }],
-			usage: { ...warmReply().usage, input: 500, cacheRead: 0, output: 1, totalTokens: 501 } }));
+			usage: { ...warmReply().usage, input: 500, cacheRead: 0, output: 1, totalTokens: 501 }
+		}));
 		await settle();
 		clock.mockReturnValue(NOW + deadline * 2 - 1);
 		c.tick();
@@ -1684,7 +1850,7 @@ test.each([
 		expect(wire.sends).toHaveLength(1);
 		await h.command(c, "warm");
 		expect(c.notifications.at(-1)).toMatch(/TTL remains unknown|KV TTL remains unknown/);
-		expect(c.status).not.toMatch(/~\d/);
+		expect(c.status).toBeUndefined();
 	}
 	await h.emit("session_shutdown", c);
 });
@@ -1699,10 +1865,14 @@ test.each(["openai-responses", "azure-openai-responses", "openai-completions"] a
 			? [{ type: "function", function: { name: "read", parameters: { type: "object" } } }]
 			: [{ type: "image_generation" }, { type: "web_search" }, { type: "mcp", server_label: "native-server" }];
 		const body: Record<string, unknown> = api === "openai-completions"
-			? { model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }], tools, tool_choice: "required",
-				parallel_tool_calls: false, reasoning_effort: "high", max_completion_tokens: 8192 }
-			: { model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], tools, tool_choice: "required",
-				parallel_tool_calls: false, reasoning: { effort: "high" }, max_output_tokens: 8192 };
+			? {
+				model: "cached-model", messages: [{ role: "user", content: "Actual prefix" }], tools, tool_choice: "required",
+				parallel_tool_calls: false, reasoning_effort: "high", max_completion_tokens: 8192
+			}
+			: {
+				model: "cached-model", input: [{ role: "user", content: "Actual prefix" }], tools, tool_choice: "required",
+				parallel_tool_calls: false, reasoning: { effort: "high" }, max_output_tokens: 8192
+			};
 		await h.emit("session_start", c);
 		await realRequest(h, c, body, assistant(usage(12, 500), { model: "cached-model", provider: "openai", api, timestamp: NOW }));
 		const completion = h.command(c, "warm now");
@@ -1730,8 +1900,10 @@ test.each([
 	const c = context([], { id: "cached-model", provider: "google", api });
 	const wire = paidBoundary({});
 	const contents = [{ role: "user", parts: [{ text: "Actual prefix" }] }];
-	const body: Record<string, unknown> = { model: "cached-model", contents, config: { maxOutputTokens: 8192 },
-		request: { contents, generationConfig: { maxOutputTokens: 8192 } } };
+	const body: Record<string, unknown> = {
+		model: "cached-model", contents, config: { maxOutputTokens: 8192 },
+		request: { contents, generationConfig: { maxOutputTokens: 8192 } }
+	};
 	await h.emit("session_start", c);
 	await h.emit("before_agent_start", c);
 	await h.emit("before_provider_request", c, { payload: body });
@@ -1748,7 +1920,8 @@ test.each([
 	await settle();
 	await h.command(c, "warm now");
 	expect(wire.sends).toHaveLength(0);
-	expect(c.status).toContain("warm unavailable");
+	expect(c.status).toBeUndefined();
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm unavailable;/);
 	expect(c.notifications.at(-1)).toMatch(/server-side tools|non-text generation/);
 	await h.emit("session_shutdown", c);
 });
@@ -1760,19 +1933,25 @@ test("explicit cache storage upkeep remains non-generative with non-text setting
 	const requests: RequestInit[] = [];
 	cacheHttp.mockImplementation(isolatedFetch(async (_url, init) => {
 		requests.push(init ?? {});
-		return Response.json({ name, model: "models/cached-model", updateTime: new Date(NOW).toISOString(),
-			expireTime: new Date(NOW + 3_600_000).toISOString(), tools: [{ googleSearch: {} }] });
+		return Response.json({
+			name, model: "models/cached-model", updateTime: new Date(NOW).toISOString(),
+			expireTime: new Date(NOW + 3_600_000).toISOString(), tools: [{ googleSearch: {} }]
+		});
 	}));
 	await h.emit("session_start", c);
-	await realRequest(h, c, { model: "cached-model", contents: [], config: { cachedContent: name,
-		responseModalities: ["IMAGE"] } }, assistant(usage(12, 500), {
+	await realRequest(h, c, {
+		model: "cached-model", contents: [], config: {
+			cachedContent: name,
+			responseModalities: ["IMAGE"]
+		}
+	}, assistant(usage(12, 500), {
 		model: "cached-model", provider: "google", api: "google-generative-ai", timestamp: NOW,
 	}));
 	c.tick();
 	await settle();
 	expect(requests).toHaveLength(1);
 	expect(provider.mock.calls).toHaveLength(0);
-	expect(c.status).toContain("~60:00");
+	expect(c.status).toBe("~60:00");
 	await h.emit("session_shutdown", c);
 });
 
@@ -1788,7 +1967,8 @@ test.each(["constructor", "toString", "__proto__"] as const)("inherited %s prope
 	await settle();
 	await h.command(c, "warm now");
 	expect(wire.sends).toHaveLength(0);
-	expect(c.status).toContain("warm unavailable");
+	expect(c.status).toBeUndefined();
+	expect(c.notifications.at(-1)).toMatch(/^Cache warm unavailable;/);
 	await h.emit("session_shutdown", c);
 });
 
@@ -1813,8 +1993,10 @@ test.each([true, false])("final transformed Anthropic thinking determines bounde
 	const h = harness();
 	const c = context([], { id: "claude-fable", provider: "anthropic", api: "anthropic-messages" });
 	const wire = paidBoundary({});
-	const body = { model: "claude-fable", messages: [{ role: "user", content: "Actual prefix" }],
-		max_tokens: 8192, thinking: { type: "enabled", budget_tokens: 4096 } as Record<string, unknown> };
+	const body = {
+		model: "claude-fable", messages: [{ role: "user", content: "Actual prefix" }],
+		max_tokens: 8192, thinking: { type: "enabled", budget_tokens: 4096 } as Record<string, unknown>
+	};
 	await h.emit("session_start", c);
 	await h.emit("before_agent_start", c);
 	await h.emit("before_provider_request", c, { payload: body });
@@ -1828,7 +2010,8 @@ test.each([true, false])("final transformed Anthropic thinking determines bounde
 	await settle();
 	if (budget) {
 		expect(wire.sends).toHaveLength(0);
-		expect(c.status).toContain("warm unavailable");
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm unavailable;/);
 		expect(c.notifications.at(-1)).toContain("budget-based thinking");
 	} else {
 		expect(wire.sends).toHaveLength(1);
@@ -1844,9 +2027,13 @@ test("observed Google image output without a declared modality is not repeated i
 	const c = context([], { id: "cached-image-model", provider: "google", api: "google-generative-ai" });
 	const wire = paidBoundary({});
 	await h.emit("session_start", c);
-	await realRequest(h, c, { model: "cached-image-model", contents: [{ role: "user", parts: [{ text: "Actual input" }] }],
-		config: { maxOutputTokens: 8192 } }, assistant(usage(12, 500), { model: "cached-image-model", provider: "google",
-		api: "google-generative-ai", timestamp: NOW, content: [{ type: "image", data: "native-image-data", mimeType: "image/png" }] }));
+	await realRequest(h, c, {
+		model: "cached-image-model", contents: [{ role: "user", parts: [{ text: "Actual input" }] }],
+		config: { maxOutputTokens: 8192 }
+	}, assistant(usage(12, 500), {
+		model: "cached-image-model", provider: "google",
+		api: "google-generative-ai", timestamp: NOW, content: [{ type: "image", data: "native-image-data", mimeType: "image/png" }]
+	}));
 	clock.mockReturnValue(NOW + 240_000);
 	c.tick();
 	await settle();
@@ -1897,7 +2084,10 @@ test.each(["gpt-6.1-sol", "gpt-6", "gpt-5.3-codex"])(
 		const body = payload({ model: id, tools: [], tool_choice: undefined });
 		await h.emit("session_start", c);
 		await realRequest(h, c, body, assistant(usage(128, 1_920), { model: id, timestamp: NOW }));
-		expect(c.status).toContain("warm pending");
+		if (id === "gpt-6.1-sol") expect(c.status).toBe("~30:00");
+		else expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in .*0 calls/);
 		const completion = h.command(c, "warm now");
 		await settle();
 		const suffix = [
@@ -1906,19 +2096,30 @@ test.each(["gpt-6.1-sol", "gpt-6", "gpt-5.3-codex"])(
 		];
 		expect(wire.sends[0].input).toEqual([...(body.input as unknown[]), ...suffix]);
 		expect(wire.sends[0].tool_choice).toBeUndefined();
-		const reply = warmReply({ model: id, content: [{ type: "text", text: "ok" }],
-			usage: { ...warmReply().usage, output: 5, totalTokens: 2_053 } });
+		const reply = warmReply({
+			model: id, content: [{ type: "text", text: "ok" }],
+			usage: { ...warmReply().usage, output: 5, totalTokens: 2_053 }
+		});
 		wire.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: reply });
 		await settle();
 		expect(wire.signals[0].aborted).toBe(false);
-		expect(c.status).toContain("warming");
+		if (id === "gpt-6.1-sol") expect(c.status).toBe("~30:00");
+		else expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm running;/);
 		wire.finish(reply);
 		await completion;
-		expect(c.status).not.toMatch(/warm pending|warming|warm miss|warm off/);
+		if (id === "gpt-6.1-sol") expect(c.status).toBe("~30:00");
+		else expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in .*1 calls/);
 		expect(c.history).toHaveLength(1);
+		expect(c.history[0].usage).toEqual(usage(128, 1_920));
 		expect(c.notifications.join(" ")).not.toContain("Reply with only");
 		await realRequest(h, c, body, assistant(usage(128, 1_920), { model: id, timestamp: NOW }));
-		expect(c.status).toContain("warm pending");
+		if (id === "gpt-6.1-sol") expect(c.status).toBe("~30:00");
+		else expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in .*1 calls/);
 		await h.emit("session_shutdown", c);
 	},
 );
@@ -1939,13 +2140,13 @@ test.each(["openai-codex-responses", "openai-responses", "anthropic-messages", "
 		await realRequest(h, c, body, assistant(usage(128, 1_920), { model: id, provider: providerName, api, timestamp: NOW }));
 		const completion = h.command(c, "warm now");
 		await settle();
-		const reply = warmReply({ model: id, provider: providerName, api,
-			usage: { ...warmReply().usage, input: 1_920, cacheRead: 0, cacheWrite: 128, totalTokens: 2_048 } });
+		const reply = warmReply({
+			model: id, provider: providerName, api,
+			usage: { ...warmReply().usage, input: 1_920, cacheRead: 0, cacheWrite: 128, totalTokens: 2_048 }
+		});
 		wire.finish(reply);
 		await completion;
-		expect(c.status).toContain("warm miss");
-		expect(c.status).toContain("ttl ?");
-		expect(c.status).not.toMatch(/~\d|warm off/);
+		expect(c.status).toBeUndefined();
 		await h.command(c, "warm");
 		expect(c.notifications.at(-1)).toMatch(/miss; next in.*1 calls.*\$0\.000448.*no cache reuse/);
 		const delay = codex ? 1_500_000 : 240_000;
@@ -1959,8 +2160,11 @@ test.each(["openai-codex-responses", "openai-responses", "anthropic-messages", "
 		expect(wire.sends).toHaveLength(2);
 		wire.finish(warmReply({ model: id, provider: providerName, api }));
 		await settle();
-		expect(c.status).not.toContain("warm miss");
-		expect(c.status).not.toContain("warm off");
+		if (codex) expect(c.status).toBe("~30:00");
+		else expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in /);
+		expect(c.notifications.at(-1)).not.toMatch(/miss;|Cache warm off;/);
 		await h.emit("session_shutdown", c);
 	},
 );
@@ -1984,14 +2188,13 @@ test.each([200, 400, 401, 413, 429, 500])(
 		const input = "https://native-test.invalid/responses";
 		const init = { method: "POST", body: "Private captured prefix", signal: wire.signals[0] };
 		const transport = wire.options[0].fetch!;
-		if (status === 400 || status === 413) {
+		if (status >= 400) {
 			let rejected: unknown;
 			try { await transport(input, init); } catch (error) { rejected = error; }
 			expect(rejected).toBeInstanceOf(Error);
 			expect("status" in (rejected as Error)).toBe(false);
 			expect(wire.signals[0].aborted).toBe(true);
 			await completion;
-			expect(c.status).toContain("warm off");
 		} else {
 			await transport(input, init);
 			expect(wire.signals[0].aborted).toBe(false);
@@ -2085,7 +2288,6 @@ test.each([{ type: "error", status: 400 }, { type: "response.failed", status: 41
 			expect(received[1].instructions).toBe(privateText); // Redaction never changed wire bytes.
 			expect(body.instructions).toBe(privateText);
 			expect(await readdir(dumpDir)).toEqual(before);
-			expect(c.status).toContain("warm off");
 			expect(c.notifications.at(-1)).toContain("The provider rejected the refresh; prompt diagnostics were suppressed.");
 			expect(c.notifications.join(" ")).not.toContain(privateText);
 			expect(c.history).toHaveLength(1);
@@ -2115,7 +2317,6 @@ test("native request-body debugging prevents hidden prompt persistence without c
 		await h.command(c, "warm now");
 		expect(provider).not.toHaveBeenCalled();
 		expect(wire.sends).toHaveLength(0);
-		expect(c.status).toContain("warm off");
 		expect(c.notifications.at(-1)).toContain("Native request-body debugging is enabled");
 		expect(Bun.env.PI_REQ_DEBUG).toBe("1");
 		expect(c.history).toHaveLength(1);
@@ -2224,7 +2425,6 @@ test.each([
 			expect(await readFile(join(dumpDir, before[0]), "utf8") === foregroundDump).toBe(true);
 			expect(completed[0].errorMessage?.includes(privateText) ?? false).toBe(false);
 			expect(c.notifications.join(" ").includes(privateText)).toBe(false);
-			expect(c.status).toContain("warm off");
 			expect(c.history).toHaveLength(1);
 		} finally {
 			await h.emit("session_shutdown", c);
@@ -2238,6 +2438,958 @@ test.each([
 	},
 	15_000,
 );
+
+test("native warm recovery: HTTP 500 pauses only the old snapshot and a new successful foreground recovers automatically", async () => {
+	const wire = nativeWarmLoopback((_body, attempt) => attempt === 1
+		? nativeWarmRejection(500, { "retry-after-ms": "0" }) : nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("Old cacheable local prefix");
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(2);
+		await wire.tick(NOW + 600_000);
+		c.tick();
+		await wire.flush();
+		expect(wire.received).toHaveLength(2);
+		await wire.foreground("New cacheable local prefix");
+		expect(wire.received).toHaveLength(3);
+		await wire.tick(NOW + 840_000);
+		expect(wire.received).toHaveLength(4);
+		expect(wire.warms[1].body.messages).toEqual([{ role: "user", content: "New cacheable local prefix" }]);
+		expect(wire.warms[1].body.max_tokens).toBe(1);
+		expect(c.history).toHaveLength(2);
+		expect(c.notifications.join(" ")).not.toContain("private rate/billing provider detail");
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+function nativeWarmSuccess(): Response {
+	const chunk = {
+		id: "chatcmpl-local-durability", object: "chat.completion.chunk", created: 1, model: "cached-model",
+		choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+		usage: {
+			prompt_tokens: 2048, completion_tokens: 1, total_tokens: 2049,
+			prompt_tokens_details: { cached_tokens: 1024 }
+		},
+	};
+	return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+		headers: { "Content-Type": "text/event-stream" },
+	});
+}
+
+function nativeWarmRejection(status: number, headers: Record<string, string> = {}): Response {
+	return Response.json({ error: { message: "private rate/billing provider detail", type: "provider_error" } }, {
+		status, headers,
+	});
+}
+
+function nativeWarmLoopback(
+	reply: (body: Record<string, unknown>, attempt: number, request: Request) => Response | Promise<Response>,
+	foregroundReply: (body: Record<string, unknown>, request: Request) => Response | Promise<Response> = nativeWarmSuccess,
+) {
+	const received: { body: Record<string, unknown>; at: number }[] = [];
+	let warmAttempts = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1", port: 0,
+		async fetch(request) {
+			if (request.method !== "POST" || new URL(request.url).pathname !== "/chat/completions") {
+				throw new Error("Unexpected native OpenAI request");
+			}
+			const body = await request.json() as Record<string, unknown>;
+			received.push({ body, at: Date.now() });
+			const cap = body.max_tokens ?? body.max_completion_tokens;
+			return cap === 1 || cap === 16
+				? reply(body, ++warmAttempts, request) : foregroundReply(body, request);
+		},
+	});
+	const baseUrl = `http://127.0.0.1:${server.port}`;
+	const endpoint = `${baseUrl}/chat/completions`;
+	cacheHttp.mockImplementation(isolatedFetch(async (input, init) => {
+		if (String(input) !== endpoint) throw new Error("Unexpected native OpenAI endpoint");
+		return nativeFetch(input, init);
+	}));
+	const model = buildModel({
+		id: "cached-model", name: "Native warm durability", provider: "openai", api: "openai-completions",
+		baseUrl, reasoning: false, input: ["text"], contextWindow: 128_000, maxTokens: 8192,
+		cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+	});
+	const h = harness();
+	const c = context([], model);
+	c.setAuth(async () => "dummy-public-sdk-api-key");
+	const replies: Promise<AssistantMessage>[] = [];
+	provider.mockImplementation((requestModel, requestContext, options) => {
+		if (!isNativeApi(requestModel, "openai-completions") || !options?.fetch) throw new Error("Expected native OpenAI refresh options");
+		const stream = streamOpenAICompletions(requestModel, requestContext, options);
+		replies.push(stream.result());
+		return stream;
+	});
+	async function flush() {
+		await settle();
+		await Promise.all(replies);
+		await settle();
+	}
+	return {
+		h, c, received, endpoint,
+		get warms() {
+			return received.filter(send => {
+				const cap = send.body.max_tokens ?? send.body.max_completion_tokens;
+				return cap === 1 || cap === 16;
+			});
+		},
+		async foreground(prefix = "Actual cacheable local prefix", finishTurn = true) {
+			const body = { model: model.id, stream: true, messages: [{ role: "user", content: prefix }], max_tokens: 8192 };
+			await h.emit("before_agent_start", c);
+			await h.emit("turn_start", c, { turnIndex: 0 });
+			await h.emit("before_provider_request", c, { payload: body });
+			const message = await streamOpenAICompletions(model, { messages: [] }, {
+				apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, onPayload: () => body,
+			}).result();
+			expect(message.stopReason).toBe("stop");
+			await h.emit("assistant_message", c, { message });
+			c.history.push(message);
+			await h.emit("message_end", c, { message });
+			await h.emit("turn_end", c);
+			if (finishTurn) await h.emit("agent_end", c);
+		},
+		flush,
+		async tick(at: number) {
+			clock.mockReturnValue(at);
+			c.tick();
+			await flush();
+		},
+		async close() {
+			await h.emit("session_shutdown", c);
+			await server.stop(true);
+			await Promise.all(replies);
+		},
+	};
+}
+
+test("native warm recovery: HTTP 429 retries only three times at 60/120/240 seconds", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmRejection(429, { "retry-after-ms": "0" }));
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm retry cooldown /);
+		for (const [offset, count] of [[59_999, 1], [60_000, 2], [179_999, 2], [180_000, 3],
+		[419_999, 3], [420_000, 4], [660_000, 4], [7_200_000, 4]] as const) {
+			await wire.tick(NOW + offset);
+			expect(wire.warms).toHaveLength(count);
+		}
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(4);
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+		expect(wire.warms.map(send => send.at)).toEqual([NOW, NOW + 60_000, NOW + 180_000, NOW + 420_000]);
+		expect(c.history).toHaveLength(1);
+		expect(c.notifications.join(" ")).not.toContain("private rate/billing provider detail");
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test.each([
+	{ name: "numeric seconds", headers: { "Retry-After": "120", "retry-after-ms": "0" }, deadline: 120_000 },
+	{ name: "HTTP date", headers: { "Retry-After": new Date(NOW + 180_000).toUTCString(), "retry-after-ms": "0" }, deadline: 180_000 },
+	{ name: "later milliseconds", headers: { "Retry-After": "30", "retry-after-ms": "90000" }, deadline: 90_000 },
+	{ name: "later seconds", headers: { "Retry-After": "120", "retry-after-ms": "90000" }, deadline: 120_000 },
+	{ name: "malformed values", headers: { "Retry-After": "not-a-date", "retry-after-ms": "NaN" }, deadline: 60_000 },
+] as const)(
+	"native warm recovery: HTTP 429 honors $name without SDK resends",
+	async ({ headers, deadline }) => {
+		const wire = nativeWarmLoopback((_body, attempt) => attempt === 1
+			? nativeWarmRejection(429, headers) : nativeWarmSuccess());
+		const { h, c } = wire;
+		try {
+			await h.emit("session_start", c);
+			await wire.foreground();
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + deadline - 1);
+			await h.command(c, "warm now");
+			await h.command(c, "warm on");
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + deadline);
+			expect(wire.warms).toHaveLength(2);
+			expect(wire.warms[1].at).toBe(NOW + deadline);
+			await wire.tick(NOW + deadline);
+			await wire.tick(NOW + deadline + 239_999);
+			expect(wire.warms).toHaveLength(2);
+			await wire.tick(NOW + deadline + 240_000);
+			expect(wire.warms).toHaveLength(3);
+			expect(wire.received).toHaveLength(4);
+		} finally {
+			await wire.close();
+		}
+	},
+	15_000,
+);
+
+test("native warm recovery: successful hidden refreshes do not replenish a snapshot's HTTP 429 retry budget", async () => {
+	const wire = nativeWarmLoopback((_body, attempt) => attempt % 2
+		? nativeWarmRejection(429, { "retry-after-ms": "0" }) : nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		for (const [offset, count] of [[60_000, 2], [300_000, 3], [419_999, 3], [420_000, 4],
+		[660_000, 5], [899_999, 5], [900_000, 6], [1_140_000, 7], [7_200_000, 7]] as const) {
+			await wire.tick(NOW + offset);
+			expect(wire.warms).toHaveLength(count);
+		}
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(7);
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+		expect(wire.warms.map(send => send.at)).toEqual([
+			NOW, NOW + 60_000, NOW + 300_000, NOW + 420_000, NOW + 660_000, NOW + 900_000, NOW + 1_140_000,
+		]);
+		await wire.foreground("Foreground resets only the new snapshot budget");
+		await wire.tick(NOW + 7_440_000);
+		expect(wire.warms).toHaveLength(8);
+		expect(wire.received).toHaveLength(10);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm recovery: status numbers inside raw error text never create quota cooldown", async () => {
+	const wire = nativeWarmLoopback((_body, attempt) => attempt === 1
+		? new Response(`data: ${JSON.stringify({ error: { message: "private HTTP 429 or 402; Retry-After: 600" } })}\n\n`, {
+			headers: { "Content-Type": "text/event-stream" },
+		}) : nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+		expect(c.notifications.at(-1)).not.toContain("cooldown");
+		await h.command(c, "warm on");
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.warms[1].at).toBe(NOW);
+		expect(wire.received).toHaveLength(3);
+		expect(c.notifications.join(" ")).not.toContain("private HTTP 429 or 402");
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test.each([429, 402])(
+	"native warm recovery: HTTP %s cooldown survives commands, foreground, identity and session restarts",
+	async status => {
+		const wire = nativeWarmLoopback((_body, attempt) => attempt === 1
+			? nativeWarmRejection(status, { "Retry-After": "600" }) : nativeWarmSuccess());
+		const { h, c } = wire;
+		try {
+			await h.emit("session_start", c);
+			await wire.foreground("Initial prefix");
+			await h.command(c, "warm now");
+			for (const transition of ["foreground", "session", "model", "restart"] as const) {
+				await h.command(c, "warm now");
+				await h.command(c, "warm on");
+				expect(wire.warms).toHaveLength(1);
+				if (transition === "session") {
+					c.setSession("new-cooldown-session");
+					await h.emit("session_switch", c);
+				} else if (transition === "model") {
+					c.model.id = "different-model";
+					c.tick();
+					c.model.id = "cached-model";
+					c.tick();
+				} else if (transition === "restart") {
+					await h.emit("session_shutdown", c);
+					await h.emit("session_start", c);
+				}
+				await wire.foreground(`New ${transition} prefix`);
+				await h.command(c, "warm now");
+				await h.command(c, "warm on");
+				await wire.tick(NOW + 240_000);
+				expect(wire.warms).toHaveLength(1);
+				expect(c.status).toBeUndefined();
+				expect(c.notifications.at(-1)).toContain("cooldown");
+			}
+			await wire.tick(NOW + 599_999);
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + 600_000);
+			expect(wire.warms).toHaveLength(2);
+			expect(wire.warms[1].body.messages).toEqual([{ role: "user", content: "New restart prefix" }]);
+			expect(wire.received).toHaveLength(7);
+			expect(c.notifications.join(" ")).not.toContain("private rate/billing provider detail");
+		} finally {
+			await wire.close();
+		}
+	},
+	15_000,
+);
+
+test("native warm recovery: HTTP 402 pauses without paid retry and requires acknowledgement after five minutes", async () => {
+	const wire = nativeWarmLoopback((_body, attempt) => attempt === 1 ? nativeWarmRejection(402) : nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		await wire.tick(NOW + 299_999);
+		await h.command(c, "warm on");
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		await wire.tick(NOW + 300_000);
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+		await h.command(c, "warm on");
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.received).toHaveLength(3);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test.each([429, 402])(
+	"native warm recovery: HTTP 200 SSE error %s establishes cooldown but never retries accepted inference",
+	async status => {
+		const wire = nativeWarmLoopback((_body, attempt) => attempt === 1
+			? new Response(`data: ${JSON.stringify({ error: { code: status, message: "private in-stream rejection" } })}\n\n`, {
+				headers: { "Content-Type": "text/event-stream" },
+			}) : nativeWarmSuccess());
+		const { h, c } = wire;
+		try {
+			await h.emit("session_start", c);
+			await wire.foreground();
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(1);
+			await h.command(c, "warm on");
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + 7_200_000);
+			c.tick();
+			await wire.flush();
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(1);
+			expect(c.status).toBeUndefined();
+			expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+			expect(c.notifications.join(" ")).not.toContain("private in-stream rejection");
+			await wire.foreground("Eligible foreground after stream failure");
+			await wire.tick(NOW + 7_440_000);
+			expect(wire.warms).toHaveLength(2);
+			expect(wire.received).toHaveLength(4);
+		} finally {
+			await wire.close();
+		}
+	},
+	15_000,
+);
+
+test("native warm recovery: an accepted timed-out HTTP request never resends the old prefix", async () => {
+	const accepted = Promise.withResolvers<void>();
+	let openBody: ReadableStreamDefaultController<Uint8Array> | undefined;
+	const wire = nativeWarmLoopback((_body, attempt) => {
+		if (attempt !== 1) return nativeWarmSuccess();
+		const response = new Response(new ReadableStream<Uint8Array>({
+			start(controller) {
+				openBody = controller;
+				controller.enqueue(new TextEncoder().encode(": accepted\n\n"));
+			},
+			cancel() { openBody = undefined; },
+		}), { headers: { "Content-Type": "text/event-stream" } });
+		accepted.resolve();
+		return response;
+	});
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("Accepted old prefix");
+		const pending = h.command(c, "warm now");
+		await accepted.promise;
+		expect(wire.warms).toHaveLength(1);
+		c.expireRequest();
+		await pending;
+		await wire.flush();
+		expect(c.status).toBeUndefined();
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm paused;/);
+		await wire.tick(NOW + 7_200_000);
+		c.tick();
+		await wire.flush();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		await wire.foreground("Fresh prefix after timeout");
+		await wire.tick(NOW + 7_440_000);
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.warms[1].body.messages).toEqual([{ role: "user", content: "Fresh prefix after timeout" }]);
+		expect(wire.received).toHaveLength(4);
+	} finally {
+		if (openBody) openBody.close();
+		await wire.close();
+	}
+}, 15_000);
+
+test.each(["warm off", "off"] as const)(
+	"native warm recovery: manual %s survives foreground replacement and shutdown/start",
+	async action => {
+		const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+		const { h, c } = wire;
+		try {
+			await h.emit("session_start", c);
+			await wire.foreground("Before manual opt-out");
+			await h.command(c, action);
+			if (action === "warm off") {
+				await h.command(c, "off");
+				await h.command(c, "on");
+			}
+			await h.emit("session_shutdown", c);
+			await h.emit("session_start", c);
+			await wire.foreground("After manual opt-out");
+			await wire.tick(NOW + 600_000);
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(0);
+			expect(wire.received).toHaveLength(2);
+			expect(c.status).toBeUndefined();
+			expect(c.notifications.at(-1)).toMatch(/^Cache warm off;/);
+			await h.command(c, action === "warm off" ? "warm on" : "on");
+			await h.command(c, "warm now");
+			expect(wire.warms).toHaveLength(1);
+		} finally {
+			await wire.close();
+		}
+	},
+	15_000,
+);
+
+test("native warm recovery: shutdown/start preserves enabled defaults without an on command", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("First open session");
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		await h.emit("session_shutdown", c);
+		expect(c.timers.size + c.timeouts.size).toBe(0);
+		await h.emit("session_start", c);
+		await wire.foreground("Reopened session prefix");
+		await wire.tick(NOW + 240_000);
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.warms[1].body.messages).toEqual([{ role: "user", content: "Reopened session prefix" }]);
+		expect(wire.received).toHaveLength(4);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm recovery: foreground events gate a ready snapshot even when ctx.isIdle is stale", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("Ready prefix inside active turn", false);
+		expect(c.ctx.isIdle()).toBe(true);
+		await wire.tick(NOW + 240_000);
+		await h.command(c, "warm now");
+		await h.command(c, "warm on");
+		c.tick();
+		await wire.flush();
+		expect(wire.warms).toHaveLength(0);
+		expect(wire.received).toHaveLength(1);
+		await h.emit("agent_end", c);
+		await wire.tick(NOW + 240_000);
+		expect(wire.warms).toHaveLength(1);
+		expect(wire.received).toHaveLength(2);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm provenance: post-reply native title request cannot replace the successful foreground prefix", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		const model = c.ctx.models.current();
+		if (!model || !isNativeApi(model, "openai-completions")) throw new Error("Expected native OpenAI model");
+		await h.emit("session_start", c);
+		c.setIdle(false);
+		await h.emit("before_agent_start", c);
+		await h.emit("turn_start", c, { turnIndex: 0 });
+		const message = await streamOpenAICompletions(model, {
+			messages: [{ role: "user", content: "Primary actual cacheable foreground prefix", timestamp: NOW }],
+		}, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 8192,
+			onPayload: async body => {
+				await h.emit("before_provider_request", c, { payload: body });
+				return body;
+			},
+			onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+		}).result();
+		expect(message.stopReason).toBe("stop");
+		await h.emit("assistant_message", c, { message });
+		c.history.push(message);
+		const title = await streamOpenAICompletions(model, {
+			systemPrompt: ["Generate a short session title."],
+			messages: [{ role: "user", content: "Auxiliary native title prefix must never become upkeep", timestamp: NOW }],
+		}, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 1024,
+			onPayload: async body => {
+				await h.emit("before_provider_request", c, { payload: body });
+				return body;
+			},
+			onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+		}).result();
+		expect(title.stopReason).toBe("stop");
+		expect(wire.received).toHaveLength(2);
+		expect(wire.received[0].body.messages).not.toEqual(wire.received[1].body.messages);
+		await h.emit("message_end", c, { message });
+		await h.emit("turn_end", c);
+		await h.emit("agent_end", c);
+		c.setIdle(true);
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(3);
+		expect(wire.warms).toHaveLength(1);
+		expect(wire.warms[0].body.messages).toEqual(wire.received[0].body.messages);
+		expect(wire.warms[0].body.messages).not.toEqual(wire.received[1].body.messages);
+		expect(wire.warms[0].body.max_tokens ?? wire.warms[0].body.max_completion_tokens).toBe(1);
+		expect(c.history).toEqual([message]);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm provenance: in-flight title hooks fail closed despite HTTP headers and recover on a fresh turn", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		const model = c.ctx.models.current();
+		if (!model || !isNativeApi(model, "openai-completions")) throw new Error("Expected native OpenAI model");
+		await h.emit("session_start", c);
+		c.setIdle(false);
+		await h.emit("before_agent_start", c);
+		await h.emit("turn_start", c, { turnIndex: 0 });
+		const primary = streamOpenAICompletions(model, {
+			messages: [{ role: "user", content: "Accepted primary prefix during native streaming", timestamp: NOW }],
+		}, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 8192,
+			onPayload: async body => {
+				await h.emit("before_provider_request", c, { payload: body });
+				return body;
+			},
+			onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+		});
+		for await (const event of primary) {
+			if (event.type !== "start") continue;
+			await h.emit("message_start", c, { message: event.partial });
+			const title = await streamOpenAICompletions(model, {
+				systemPrompt: ["Generate a short session title."],
+				messages: [{ role: "user", content: "In-flight auxiliary title must never become upkeep", timestamp: NOW }],
+			}, {
+				apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 1024,
+				onPayload: async body => {
+					await h.emit("before_provider_request", c, { payload: body });
+					return body;
+				},
+				onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+			}).result();
+			expect(title.stopReason).toBe("stop");
+			expect(wire.received).toHaveLength(2);
+		}
+		const message = await primary.result();
+		expect(message.stopReason).toBe("stop");
+		await h.emit("assistant_message", c, { message });
+		c.history.push(message);
+		await h.emit("message_end", c, { message });
+		await h.emit("turn_end", c);
+		await h.emit("agent_end", c);
+		c.setIdle(true);
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(2);
+		expect(wire.warms).toHaveLength(0);
+		await h.command(c, "warm on");
+		await wire.tick(NOW + 600_000);
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(2);
+		expect(wire.warms).toHaveLength(0);
+		await wire.foreground("Fresh unambiguous prefix after an in-flight title");
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(4);
+		expect(wire.warms).toHaveLength(1);
+		expect(wire.warms[0].body.messages).toEqual(wire.received[2].body.messages);
+		expect(wire.warms[0].body.messages).not.toEqual(wire.received[1].body.messages);
+		expect(c.history).toHaveLength(2);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm provenance: late old auxiliary headers cannot authorize a rejected foreground retry payload", async () => {
+	let rejected = false;
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess(), body => {
+		if (rejected || body.reasoning_effort !== "low") return nativeWarmSuccess();
+		rejected = true;
+		return Response.json({
+			error: {
+				message: "Unsupported value: 'low' is not supported for 'reasoning_effort'. Supported values are: 'medium'.",
+				type: "invalid_request_error", param: "reasoning_effort", code: "unsupported_value",
+			}
+		}, { status: 400 });
+	});
+	const { h, c } = wire;
+	try {
+		const model = c.ctx.models.current();
+		if (!model || !isNativeApi(model, "openai-completions")) throw new Error("Expected native OpenAI model");
+		Object.assign(model, { reasoning: true, compat: { ...model.compat, supportsReasoningEffort: true } });
+		await h.emit("session_start", c);
+		let oldAuxiliaryHeaders: Record<string, unknown> | undefined;
+		const oldTitle = await streamOpenAICompletions(model, {
+			systemPrompt: ["Generate a short session title."],
+			messages: [{ role: "user", content: "Auxiliary request from an earlier turn", timestamp: NOW }],
+		}, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 1024, reasoning: "medium",
+			onPayload: async body => {
+				await h.emit("before_provider_request", c, { payload: body });
+				return body;
+			},
+			onResponse: response => { oldAuxiliaryHeaders = { ...response }; },
+		}).result();
+		expect(oldTitle.stopReason).toBe("stop");
+		expect(wire.received).toHaveLength(1);
+		c.setIdle(false);
+		await h.emit("before_agent_start", c);
+		await h.emit("turn_start", c, { turnIndex: 0 });
+		let deliveredOldHeaders = false;
+		const message = await streamOpenAICompletions(model, {
+			messages: [{ role: "user", content: "Foreground requiring a native reasoning rebuild", timestamp: NOW }],
+		}, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 8192, reasoning: "low",
+			onPayload: async body => {
+				await h.emit("before_provider_request", c, { payload: body });
+				if (!deliveredOldHeaders) {
+					if (!oldAuxiliaryHeaders) throw new Error("Expected actual old auxiliary response headers");
+					deliveredOldHeaders = true;
+					await h.emit("after_provider_response", c, oldAuxiliaryHeaders);
+				}
+				return body;
+			},
+			onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+		}).result();
+		expect(message.stopReason).toBe("stop");
+		expect(wire.received).toHaveLength(3);
+		expect(wire.received[1].body.reasoning_effort).toBe("low");
+		expect(wire.received[2].body.reasoning_effort).toBe("medium");
+		await h.emit("assistant_message", c, { message });
+		c.history.push(message);
+		await h.emit("message_end", c, { message });
+		await h.emit("turn_end", c);
+		await h.emit("agent_end", c);
+		c.setIdle(true);
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(0);
+		expect(wire.received).toHaveLength(3);
+		await h.command(c, "warm on");
+		await wire.tick(NOW + 600_000);
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(0);
+		await wire.foreground("Fresh unambiguous real foreground prefix");
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		expect(wire.received).toHaveLength(5);
+		expect(wire.warms[0].body.messages).toEqual(wire.received[3].body.messages);
+		expect(c.history).toHaveLength(2);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm provenance: distinct pre-stream reasoning recovery fails closed until a fresh turn", async () => {
+	let foregroundAttempts = 0;
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess(), () => {
+		if (++foregroundAttempts !== 1) return nativeWarmSuccess();
+		return Response.json({
+			error: {
+				message: "Unsupported value: 'low' is not supported for 'reasoning_effort'. Supported values are: 'medium'.",
+				type: "invalid_request_error", param: "reasoning_effort", code: "unsupported_value",
+			}
+		}, { status: 400 });
+	});
+	const { h, c } = wire;
+	try {
+		const model = c.ctx.models.current();
+		if (!model || !isNativeApi(model, "openai-completions")) throw new Error("Expected native OpenAI model");
+		Object.assign(model, { reasoning: true, compat: { ...model.compat, supportsReasoningEffort: true } });
+		await h.emit("session_start", c);
+		const foreground = async (reasoning: "low" | "medium", prefix: string) => {
+			c.setIdle(false);
+			await h.emit("before_agent_start", c);
+			await h.emit("turn_start", c, { turnIndex: 0 });
+			const message = await streamOpenAICompletions(model, {
+				messages: [{ role: "user", content: prefix, timestamp: NOW }],
+			}, {
+				apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, maxTokens: 8192, reasoning,
+				onPayload: async body => {
+					await h.emit("before_provider_request", c, { payload: body });
+					return body;
+				},
+				onResponse: async response => { await h.emit("after_provider_response", c, { ...response }); },
+			}).result();
+			expect(message.stopReason).toBe("stop");
+			await h.emit("assistant_message", c, { message });
+			c.history.push(message);
+			await h.emit("message_end", c, { message });
+			await h.emit("turn_end", c);
+			await h.emit("agent_end", c);
+			c.setIdle(true);
+		};
+		await foreground("low", "Actual native reasoning fallback prefix");
+		expect(wire.received).toHaveLength(2);
+		expect(wire.received[0].body.reasoning_effort).toBe("low");
+		expect(wire.received[1].body.reasoning_effort).toBe("medium");
+		await h.command(c, "warm on");
+		await h.command(c, "warm now");
+		await wire.tick(NOW + 600_000);
+		expect(wire.received).toHaveLength(2);
+		expect(wire.warms).toHaveLength(0);
+		await foreground("medium", "Fresh explicitly owned foreground prefix");
+		await h.command(c, "warm now");
+		expect(wire.received).toHaveLength(4);
+		expect(wire.warms).toHaveLength(1);
+		expect(wire.warms[0].body.messages).toEqual(wire.received[2].body.messages);
+		expect(wire.warms[0].body.reasoning_effort).toBe("medium");
+		expect(wire.warms[0].body.max_tokens ?? wire.warms[0].body.max_completion_tokens).toBe(16);
+		expect(c.history).toHaveLength(2);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm provenance: a new turn's unfinalized request cannot borrow a delayed prior successful message_end", async () => {
+	const wire = nativeWarmLoopback(() => nativeWarmSuccess());
+	const { h, c } = wire;
+	try {
+		const model = c.ctx.models.current();
+		if (!model || !isNativeApi(model, "openai-completions")) throw new Error("Expected native OpenAI model");
+		const body = {
+			model: model.id, stream: true,
+			messages: [{ role: "user", content: "Actually dispatched prior foreground prefix" }], max_tokens: 8192
+		};
+		await h.emit("session_start", c);
+		await h.emit("before_agent_start", c);
+		await h.emit("turn_start", c, { turnIndex: 0 });
+		await h.emit("before_provider_request", c, { payload: body });
+		const message = await streamOpenAICompletions(model, { messages: [] }, {
+			apiKey: "dummy-public-sdk-api-key", fetch: cacheHttp, onPayload: () => body,
+		}).result();
+		expect(message.stopReason).toBe("stop");
+		await h.emit("assistant_message", c, { message });
+		c.history.push(message);
+		await h.emit("turn_start", c, { turnIndex: 1 });
+		await h.emit("before_provider_request", c, {
+			payload: {
+				...body, messages: [{ role: "user", content: "New unfinalized request never proved successful" }],
+			}
+		});
+		await h.emit("message_end", c, { message });
+		await h.emit("agent_end", c);
+		await wire.tick(NOW + 7_200_000);
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(0);
+		expect(wire.received).toHaveLength(1);
+		expect(wire.received[0].body.messages).toEqual(body.messages);
+		expect(c.history).toEqual([message]);
+	} finally {
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm recovery: late accepted completion cannot refresh or reschedule a replacement snapshot", async () => {
+	const accepted = Promise.withResolvers<void>();
+	const delayed = Promise.withResolvers<Response>();
+	const wire = nativeWarmLoopback((_body, attempt) => {
+		if (attempt !== 1) return nativeWarmSuccess();
+		accepted.resolve();
+		return delayed.promise;
+	});
+	const { h, c } = wire;
+	cacheHttp.mockImplementation(isolatedFetch(async (input, init) => {
+		if (String(input) !== wire.endpoint) throw new Error("Unexpected native OpenAI endpoint");
+		// The server may finish an accepted request even after local cancellation.
+		return nativeFetch(input, { ...init, signal: undefined });
+	}));
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("Old accepted prefix");
+		const pending = h.command(c, "warm now");
+		await accepted.promise;
+		expect(wire.warms).toHaveLength(1);
+		clock.mockReturnValue(NOW + 60_000);
+		await wire.foreground("Replacement foreground prefix");
+		await pending;
+		clock.mockReturnValue(NOW + 120_000);
+		delayed.resolve(nativeWarmSuccess());
+		await wire.flush();
+		await wire.tick(NOW + 299_999);
+		expect(wire.warms).toHaveLength(1);
+		await wire.tick(NOW + 300_000);
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.warms[1].body.messages).toEqual([{ role: "user", content: "Replacement foreground prefix" }]);
+		expect(wire.received).toHaveLength(4);
+		expect(c.history).toHaveLength(2);
+	} finally {
+		delayed.resolve(nativeWarmSuccess());
+		await wire.close();
+	}
+}, 15_000);
+
+test("native warm recovery: late cancelled HTTP 429 gates new sends without discarding an accepted current refresh", async () => {
+	const oldAccepted = Promise.withResolvers<void>();
+	const currentAccepted = Promise.withResolvers<void>();
+	const oldReply = Promise.withResolvers<Response>();
+	const currentReply = Promise.withResolvers<Response>();
+	const oldRejectionReceived = Promise.withResolvers<void>();
+	const wire = nativeWarmLoopback((_body, attempt) => {
+		if (attempt === 1) {
+			oldAccepted.resolve();
+			return oldReply.promise;
+		}
+		if (attempt === 2) {
+			currentAccepted.resolve();
+			return currentReply.promise;
+		}
+		return nativeWarmSuccess();
+	});
+	const { h, c } = wire;
+	cacheHttp.mockImplementation(isolatedFetch(async (input, init) => {
+		if (String(input) !== wire.endpoint) throw new Error("Unexpected native OpenAI endpoint");
+		const response = await nativeFetch(input, { ...init, signal: undefined });
+		if (response.status === 429) oldRejectionReceived.resolve();
+		return response;
+	}));
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground("Old rejected prefix");
+		const pending = h.command(c, "warm now");
+		await oldAccepted.promise;
+		clock.mockReturnValue(NOW + 60_000);
+		await wire.foreground("Current accepted prefix");
+		await pending;
+		clock.mockReturnValue(NOW + 300_000);
+		c.tick();
+		await currentAccepted.promise;
+		expect(wire.warms).toHaveLength(2);
+		oldReply.resolve(nativeWarmRejection(429, { "Retry-After": "600" }));
+		await oldRejectionReceived.promise;
+		await settle();
+		currentReply.resolve(nativeWarmSuccess());
+		await wire.flush();
+		expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm cooldown /);
+		expect(c.notifications.at(-1)).not.toContain("paused");
+		await wire.tick(NOW + 899_999);
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(2);
+		await wire.tick(NOW + 900_000);
+		expect(wire.warms).toHaveLength(3);
+		expect(wire.warms[2].body.messages).toEqual([{ role: "user", content: "Current accepted prefix" }]);
+		expect(wire.received).toHaveLength(5);
+		expect(c.history).toHaveLength(2);
+	} finally {
+		oldReply.resolve(nativeWarmSuccess());
+		currentReply.resolve(nativeWarmSuccess());
+		await wire.close();
+	}
+}, 15_000);
+
+test.each([
+	{ name: "warm on", commands: ["warm on"] },
+	{ name: "warm off/on", commands: ["warm off", "warm on"] },
+	{ name: "display off/on", commands: ["off", "on"] },
+])(
+	"native warm recovery: $name preserves the completion heartbeat floor after slow successful upkeep",
+	async ({ commands }) => {
+		const accepted = Promise.withResolvers<void>();
+		const delayed = Promise.withResolvers<Response>();
+		const wire = nativeWarmLoopback((_body, attempt) => {
+			if (attempt !== 1) return nativeWarmSuccess();
+			accepted.resolve();
+			return delayed.promise;
+		});
+		const { h, c } = wire;
+		c.model.promptCache = { short: 10 };
+		try {
+			await h.emit("session_start", c);
+			await wire.foreground();
+			clock.mockReturnValue(NOW + 9_000);
+			c.tick();
+			await accepted.promise;
+			expect(wire.warms).toHaveLength(1);
+			clock.mockReturnValue(NOW + 21_000);
+			delayed.resolve(nativeWarmSuccess());
+			await wire.flush();
+			for (const command of commands) await h.command(c, command);
+			await wire.tick(NOW + 21_000);
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + 21_999);
+			expect(wire.warms).toHaveLength(1);
+			await wire.tick(NOW + 22_000);
+			expect(wire.warms).toHaveLength(2);
+			expect(wire.warms.map(send => send.at)).toEqual([NOW + 9_000, NOW + 22_000]);
+			expect(wire.received).toHaveLength(3);
+		} finally {
+			delayed.resolve(nativeWarmSuccess());
+			await wire.close();
+		}
+	},
+	15_000,
+);
+
+test("native warm recovery: wake sends one due request and completion defers catch-up by a heartbeat", async () => {
+	const accepted = Promise.withResolvers<void>();
+	const delayed = Promise.withResolvers<Response>();
+	const wire = nativeWarmLoopback((_body, attempt) => {
+		if (attempt !== 1) return nativeWarmSuccess();
+		accepted.resolve();
+		return delayed.promise;
+	});
+	const { h, c } = wire;
+	try {
+		await h.emit("session_start", c);
+		await wire.foreground();
+		clock.mockReturnValue(NOW + 7_200_000);
+		c.tick();
+		c.tick();
+		c.tick();
+		await accepted.promise;
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		clock.mockReturnValue(NOW + 7_500_000);
+		c.tick();
+		c.tick();
+		await h.command(c, "warm now");
+		expect(wire.warms).toHaveLength(1);
+		delayed.resolve(nativeWarmSuccess());
+		await wire.flush();
+		await wire.tick(NOW + 7_500_000);
+		await wire.tick(NOW + 7_500_999);
+		expect(wire.warms).toHaveLength(1);
+		await wire.tick(NOW + 7_501_000);
+		expect(wire.warms).toHaveLength(2);
+		expect(wire.received).toHaveLength(3);
+	} finally {
+		delayed.resolve(nativeWarmSuccess());
+		await wire.close();
+	}
+}, 15_000);
 
 test("public SDK release: native OpenAI HTTP 500 retry cannot resend a hidden inference", async () => {
 	type InferencePhase = "foreground-control" | "warm";
@@ -2258,8 +3410,10 @@ test("public SDK release: native OpenAI HTTP 500 retry cannot resend a hidden in
 			const chunk = {
 				id: "chatcmpl-local-regression", object: "chat.completion.chunk", created: 1, model: "cached-model",
 				choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-				usage: { prompt_tokens: 2048, completion_tokens: 1, total_tokens: 2049,
-					prompt_tokens_details: { cached_tokens: 1024 } },
+				usage: {
+					prompt_tokens: 2048, completion_tokens: 1, total_tokens: 2049,
+					prompt_tokens_details: { cached_tokens: 1024 }
+				},
 			};
 			return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
 				headers: { "Content-Type": "text/event-stream" },
@@ -2276,8 +3430,10 @@ test("public SDK release: native OpenAI HTTP 500 retry cannot resend a hidden in
 		baseUrl, reasoning: false, input: ["text"], contextWindow: 128_000, maxTokens: 8192,
 		cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
 	});
-	const body = { model: model.id, stream: true, messages: [{ role: "user", content: "Actual cacheable local prefix" }],
-		max_tokens: 8192 };
+	const body = {
+		model: model.id, stream: true, messages: [{ role: "user", content: "Actual cacheable local prefix" }],
+		max_tokens: 8192
+	};
 	const h = harness();
 	const c = context([], model);
 	c.setAuth(async () => "dummy-public-sdk-api-key");
@@ -2308,8 +3464,6 @@ test("public SDK release: native OpenAI HTTP 500 retry cannot resend a hidden in
 		const completed = await Promise.all(replies);
 		expect(completed).toHaveLength(1);
 		expect(["error", "aborted"]).toContain(completed[0].stopReason);
-		expect(c.status).toContain("warm off");
-		expect(c.notifications.at(-1)).toContain("automatic warm retries are disabled");
 		expect(c.history).toHaveLength(1);
 	} finally {
 		await h.emit("session_shutdown", c);
@@ -2344,15 +3498,17 @@ test.each([
 			const url = String(input);
 			const method = init?.method ?? "GET";
 			if (![`${base}/${oldName}`, `${base}/${oldName}?updateMask=ttl`,
-				`${base}/${finalName}`, `${base}/${finalName}?updateMask=ttl`].includes(url)) {
+			`${base}/${finalName}`, `${base}/${finalName}?updateMask=ttl`].includes(url)) {
 				throw new Error("Unexpected explicit-cache resource request");
 			}
 			requests.push({ url, method, body: init?.body });
 			const name = url.includes(finalName) ? finalName : oldName;
 			return Response.json(method === "PATCH"
 				? { name, expireTime: new Date(NOW + 1_800_000).toISOString() }
-				: { name, model: "models/gemini-cached", createTime: new Date(NOW).toISOString(),
-					expireTime: new Date(NOW + 600_000).toISOString() });
+				: {
+					name, model: "models/gemini-cached", createTime: new Date(NOW).toISOString(),
+					expireTime: new Date(NOW + 600_000).toISOString()
+				});
 		}));
 		const body = {
 			model: "gemini-cached", contents: [{ role: "user", parts: [{ text: "Final foreground prefix" }] }],
@@ -2393,7 +3549,8 @@ test.each([
 				expect(requests).toHaveLength(0);
 				expect(wire.sends).toHaveLength(0);
 				expect(provider).not.toHaveBeenCalled();
-				expect(c.status).toContain("warm unavailable");
+				expect(c.status).toBeUndefined();
+				expect(c.notifications.at(-1)).toMatch(/^Cache warm unavailable;/);
 				expect(c.notifications.at(-1)).toContain("resource identity");
 			}
 			expect(c.history).toHaveLength(1);
@@ -2476,7 +3633,9 @@ test("public SDK release: native Google chunked UTF-8 multiline SSE preserves a 
 		await h.emit("session_start", c);
 		await realRequest(h, c, body, foreground);
 		const branch = structuredClone(c.ctx.sessionManager.getBranch());
-		expect(c.status).toContain("warm pending");
+		expect(c.status).toBeUndefined();
+		await h.command(c, "warm");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in .*0 calls/);
 		clock.mockReturnValue(NOW + 60_000);
 		await h.command(c, "warm now");
 		const completed = await Promise.all(replies);
@@ -2490,8 +3649,8 @@ test("public SDK release: native Google chunked UTF-8 multiline SSE preserves a 
 		expect(received[0].systemInstruction).toEqual(body.config.systemInstruction);
 		expect((received[0].generationConfig as Record<string, unknown>).maxOutputTokens).toBe(1);
 		expect(body.config.maxOutputTokens).toBe(8192);
-		expect(c.status).not.toMatch(/warm pending|warming|warm miss|warm off|warm unavailable/);
-		expect(c.status).toMatch(/\b98%/);
+		expect(c.status).toBe("~5:00");
+		expect(c.notifications.at(-1)).toMatch(/^Cache warm next in /);
 		expect(c.ctx.sessionManager.getBranch()).toEqual(branch);
 		expect(c.history).toEqual([foreground]);
 		await h.command(c, "warm");
@@ -2601,7 +3760,6 @@ test.each([
 			expect(await readFile(join(dumpDir, before[0]), "utf8")).toBe(foregroundDump);
 			expect(completed[0].errorMessage?.includes(privateText) ?? false).toBe(false);
 			expect(c.notifications.join(" ").includes(privateText)).toBe(false);
-			expect(c.status).toContain("warm off");
 			expect(c.history).toHaveLength(1);
 		} finally {
 			await h.emit("session_shutdown", c);
@@ -2636,8 +3794,10 @@ test.each([
 		} : {
 			id: "chatcmpl-local-closure", object: "chat.completion.chunk", created: 1, model: modelId,
 			choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-			usage: { prompt_tokens: 2048, completion_tokens: 1, total_tokens: 2049,
-				prompt_tokens_details: { cached_tokens: 1024 } },
+			usage: {
+				prompt_tokens: 2048, completion_tokens: 1, total_tokens: 2049,
+				prompt_tokens_details: { cached_tokens: 1024 }
+			},
 		};
 		const bytes = new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`);
 		const server = Bun.serve({
@@ -2718,7 +3878,8 @@ test.each([
 			await h.command(c, "warm now");
 			const completed = await Promise.all(replies);
 			await warmCancelled.promise;
-			expect(c.status).not.toMatch(/warm pending|warming|warm miss|warm off|warm unavailable/);
+			expect(c.status).toBe("~5:00");
+			expect(c.notifications.at(-1)).toMatch(/^Cache warm next in /);
 			expect(completed).toHaveLength(1);
 			expect(completed[0].stopReason).toBe("stop");
 			expect(completed[0].content).toEqual([{ type: "text", text: "ok" }]);
@@ -2737,7 +3898,7 @@ test.each([
 				expect(warmSends[0].body.max_tokens).toBe(1);
 				expect(completionsBody.max_tokens).toBe(8192);
 			}
-			expect(c.status).toMatch(/\b98%/);
+			expect(c.status).toBe("~5:00");
 			expect(c.ctx.sessionManager.getBranch()).toEqual(branch);
 			expect(c.history).toEqual([foreground]);
 			await h.command(c, "warm");
@@ -2774,10 +3935,12 @@ test.each([
 		const event = anthropic ? "error" : "response.completed";
 		const envelope = anthropic
 			? { type: "error", error: { type: "invalid_request_error", message: echoedText } }
-			: { type: "response.completed", response: {
-				id: "resp_local_failed", status: "failed", output: [],
-				status_details: { error: { code: "invalid_request_error", message: echoedText } },
-			} };
+			: {
+				type: "response.completed", response: {
+					id: "resp_local_failed", status: "failed", output: [],
+					status_details: { error: { code: "invalid_request_error", message: echoedText } },
+				}
+			};
 		const server = Bun.serve({
 			hostname: "127.0.0.1", port: 0,
 			async fetch(request) {
@@ -2859,7 +4022,6 @@ test.each([
 			expect(await readFile(join(dumpDir, before[0]), "utf8")).toBe(foregroundDump);
 			expect(completed[0].errorMessage?.includes(privateText) ?? false).toBe(false);
 			expect(c.notifications.join(" ").includes(privateText)).toBe(false);
-			expect(c.status).toContain("warm off");
 			expect(c.history).toHaveLength(1);
 		} finally {
 			await h.emit("session_shutdown", c);
@@ -2899,9 +4061,11 @@ test.each(["unknown-exception", "cache-hit"] as const)(
 				frame("event", "contentBlockDelta", { contentBlockIndex: 0, delta: { text: "é" } }),
 				frame("event", "contentBlockStop", { contentBlockIndex: 0 }),
 				frame("event", "messageStop", { stopReason: "end_turn" }),
-				frame("event", "metadata", { usage: {
-					inputTokens: 12, outputTokens: 1, cacheReadInputTokens: 500, cacheWriteInputTokens: 0, totalTokens: 513,
-				} }),
+				frame("event", "metadata", {
+					usage: {
+						inputTokens: 12, outputTokens: 1, cacheReadInputTokens: 500, cacheWriteInputTokens: 0, totalTokens: 513,
+					}
+				}),
 			];
 		const root = await mkdtemp(join(tmpdir(), "cache-native-bedrock-"));
 		const debug = Bun.env.PI_REQ_DEBUG;
@@ -3014,14 +4178,14 @@ test.each(["unknown-exception", "cache-hit"] as const)(
 				expect(await readFile(join(dumpDir, before[0]), "utf8")).toBe(foregroundDump!);
 				expect(completed[0].errorMessage?.includes(privateText) ?? false).toBe(false);
 				expect(c.notifications.join(" ").includes(privateText)).toBe(false);
-				expect(c.status).toContain("warm off");
 			} else {
-				expect(c.status).not.toMatch(/warm pending|warming|warm miss|warm off|warm unavailable/);
+				expect(c.status).toBe("~5:00");
+				expect(c.notifications.at(-1)).toMatch(/^Cache warm next in /);
 				expect(completed[0].stopReason).toBe("stop");
 				expect(completed[0].content[0]).toMatchObject({ type: "text", text: "é" });
 				expect(completed[0].usage.cacheRead).toBe(500);
 				expect(completed[0].usage.output).toBe(1);
-				expect(c.status).toMatch(/\b98%/);
+				expect(c.status).toBe("~5:00");
 				await h.command(c, "warm");
 				expect(c.notifications.at(-1)).toMatch(/1 calls/);
 				expect(c.notifications.at(-1)).not.toMatch(/unpriced|no cache reuse/);
@@ -3147,7 +4311,6 @@ test("public SDK closure: native CLI ignores flat success and inspects an indexa
 		expect(await readFile(join(dumpDir, before[0]), "utf8")).toBe(foregroundDump);
 		expect(completed[0].errorMessage?.includes(privateText) ?? false).toBe(false);
 		expect(c.notifications.join(" ").includes(privateText)).toBe(false);
-		expect(c.status).toContain("warm off");
 		expect(c.history).toHaveLength(1);
 	} finally {
 		await h.emit("session_shutdown", c);

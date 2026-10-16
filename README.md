@@ -1,7 +1,7 @@
 <div align="center">
 
 <img src="./assets/readme/hero.svg" width="100%"
-     alt="cache control, an omp extension: see real prompt-cache reuse and refresh eligible idle prefixes. Illustrated /cache warm example with a historical three-call ledger; paid upkeep starts on, hidden replies stay outside chat history, and retention is not guaranteed.">
+     alt="cache control, an omp extension: watch the estimated prompt-cache countdown and refresh eligible idle prefixes. Illustrated /cache warm example with a historical three-call ledger; paid upkeep starts on, hidden replies stay outside chat history, and retention is not guaranteed.">
 
 <p>
 <img src="https://img.shields.io/badge/typescript-1E1E22?style=flat-square" alt="TypeScript">
@@ -13,7 +13,7 @@
 
 </div>
 
-**Cache Control** is an omp extension that shows how much of your latest request the provider read from a prompt cache. While the native TUI is idle, it can refresh an eligible prefix without adding messages to your chat history.
+**Cache Control** is an omp extension that shows an estimated prompt-cache expiry countdown. While the native TUI is idle, it can refresh an eligible prefix without adding messages to your chat history.
 
 **Status and paid automatic warming start on. Provider retention is not guaranteed.**
 
@@ -56,7 +56,7 @@ For visibility without paid upkeep, run `/cache warm off`. This lasts only for t
 2. Inspect `/cache warm` in the **native OMP TUI**. It reports eligibility, the next refresh, call count, estimated inference cost, and unpriced calls. These slash commands are **not shell commands or model tools**: use a verified TUI-control capability if available; otherwise ask the user to enter them. Never claim to have executed them by printing them in chat.
 3. Leave the TUI open during genuine idle breaks. Eligible maintenance runs automatically; no ping loop or repeated `/cache warm now` is needed. Real user work cancels maintenance, and hidden warm replies stay outside chat history.
 4. Respect the user's choice: `/cache warm off` keeps visibility without paid upkeep; `/cache off` suspends both status and maintenance. Re-enable paid upkeep only when requested, using `/cache on` followed by `/cache warm on`. Switches are process-local; restarting restores the defaults. Uninstalling is the persistent extension opt-out.
-5. If warming is pending, unavailable, or stopped, read the reported reason and [troubleshooting guidance](docs/lifecycle.md#troubleshooting). Do not bypass guards, rewrite the captured prefix, change the model, or retry paid requests to force a green status. Antigravity warming is deliberately unavailable.
+5. If warming is pending, unavailable, paused, or cooling down, read the reported reason and [troubleshooting guidance](docs/lifecycle.md#troubleshooting). Operational failures do not change manual opt-out; a new eligible real request can resume warming. Do not bypass guards, rewrite the captured prefix, change the model, or retry paid requests to force a green status. Antigravity warming is deliberately unavailable.
 
 ### explain the benefit honestly
 
@@ -67,7 +67,7 @@ This is primarily an **input-cost opportunity, not fewer tokens or unlimited quo
 - **Best fit:** long, cacheable sessions with substantial reusable prefixes and idle breaks. Active requests already provide normal cache activity; short or ineligible prompts may gain nothing.
 - **Savings condition:** avoided cold-input charges must exceed paid refresh inference and any cache-storage charges. Provider prices, retention, cache misses, and the user's return pattern determine the result. There is no measured universal savings percentage.
 - **Observed, not guaranteed:** the historical Codex workflow reported three cache-hit refreshes over **80.0475 minutes**, **23,936 cached input tokens** when work resumed after roughly 50 minutes, and **$0.008034 estimated inference warm cost** for those three calls. This was not a comparison against disabling warming and does not prove net savings.
-- **Read the indicators correctly:** the cache percentage describes the latest matching request's input reuse, not account quota or money saved. `~` means an inferred timer. The process-local warm ledger is not the total bill; unpriced calls are not free, and cache-storage charges are separate.
+- **Read the timer correctly:** `~` means an estimated cache-expiry countdown, not a refresh schedule or retention guarantee. The process-local warm ledger is not the total bill; unpriced calls are not free, and cache-storage charges are separate.
 
 When reporting results to the user, distinguish **actual provider-reported cache reads**, **estimated maintenance cost**, and **unknown net savings**. Do not promise that a scheduled timer means the cache remains warm.
 
@@ -77,7 +77,7 @@ When reporting results to the user, distinguish **actual provider-reported cache
 
 ## look
 
-The status shows **cache-read percentage for the latest matching assistant request**, an estimated countdown or unknown TTL, and the warm state. The percentage is **not account quota**. A `~` timer is an estimate, not a retention guarantee.
+The status shows **only the estimated cache-expiry countdown**, such as `~29:50`. When no estimate is available or it has expired, this extension's segment is hidden. Other OMP status segments are unchanged. `/cache warm` retains the detailed warm state, schedule, call count, and estimated cost.
 
 Illustrated `/cache warm` output, line-wrapped for readability. The three-call cost comes from the historical ledger below; the countdown is an example, not a recorded or current provider state.
 
@@ -107,6 +107,8 @@ Only reported cache reuse advances the estimated warm anchor. A miss keeps the n
 ## commands
 
 `/cache warm` explains the current warm state. `/cache warm off` keeps visibility without paid upkeep.
+
+In the native TUI, `/cache ` suggests `on`, `off`, and `warm`; `/cache warm ` suggests `on`, `off`, and `now`. Type a prefix and press Tab to accept, for example `/cache w` → `/cache warm` or `/cache warm n` → `/cache warm now`. Suggestions mark paid warming actions and stop after a completed terminal argument followed by whitespace. Command arguments are case-sensitive.
 
 <details>
 <summary><b>all seven commands and process-local switches</b></summary>
@@ -224,7 +226,7 @@ While loaded in the native TUI, this extension stops omp's own warmer—even whe
 
 ## troubleshooting
 
-- **No status:** enable the custom layout's `status` segment and run `/cache on`. Symbol style follows **Settings → Appearance → Theme → Symbol Preset**.
+- **No timer:** enable the custom layout's `status` segment and run `/cache on`. This extension stays hidden when no matching expiry estimate is available or it has expired; `/cache warm` still reports the warmer's details.
 - **Pending or unavailable:** finish a real cacheable request and queued work; `/cache warm` reports the current reason. Restored history alone cannot authorize warming.
 - **Stopped after a failure:** fix the reported cause, then `/cache warm on`. A miss does not prove a refreshed cache, and a cancelled request may still be billable.
 

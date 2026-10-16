@@ -57,6 +57,57 @@ Required checks are `bun run build:cache-replay`, `bun run typecheck`, `bun run 
 
 On **2026-10-10**, Windows/Bun **1.4.2** passed helper generation, strict TypeScript checking, all **189 existing regressions / 1,448 assertions**, and the new compiled-CLI E2E against native OMP **18.8.7**. The regression suite retained its native-loopback privacy and consumer-cancellation cases. A separate isolated startup loaded the native-linked Cache Control together with twelve other active custom extension entries, advertised `/cache`, `/ysk`, and `/atlas`, and exited zero with empty stderr; no prompt or real credential was supplied. These checks are not new live-provider, native-TUI, or retention evidence.
 
+### Durability recovery: 2026-10-11
+
+On Windows/Bun **1.4.2**, the final regression suite passed **219 tests / 1,717 assertions**, including 30 new native-SDK recovery/provenance cases. Strict TypeScript checking also passed. The isolated compiled-CLI load E2E passed against the installed **18.8.9** binary; that establishes loading only, not full 18.8.9 compatibility. The development SDK remains pinned to **18.8.7**; the generated helper bundle was unchanged and was not rebuilt.
+
+The new cases use the actual extension entrypoint and native SDK HTTP/SSE against loopback endpoints. They exercise bounded 429 retries and provider deadlines, instance-wide quota cooldowns, timeout/no-resend behavior, manual opt-out, cancellation, foreground exclusion, cadence floors, and auxiliary-request ownership. These endpoints return synthetic usage and incur no provider charges.
+
+A separate real Windows native-TUI run used the pinned **18.8.7 source launcher**, an isolated temporary profile, and a loopback OpenAI-compatible endpoint. Before the fix, a background title request replaced the settled foreground snapshot and `/cache warm now` sent nothing. After the fix, the server observed a bounded hidden request returning HTTP 500, then—after a normal successful foreground request and **without** `/cache warm on`—a second bounded hidden request returning HTTP 200. Both hidden requests had an output cap of **1**; the TUI reported paused state after the first and a scheduled next refresh after the second. The CLI exited cleanly and the temporary server/profile were removed.
+
+This proves native capture and recovery through the real terminal, not paid-provider retention or a natural idle soak. Distinct same-turn payloads before settlement deliberately remain unavailable until another eligible real turn.
+
+### Paid natural Haiku soak: 2026-10-11
+
+With explicit authorization for paid testing, the current source ran in the real Windows native TUI on pinned **OMP 18.8.7**, using **`anthropic/claude-haiku-4-5-20251001`** and short cache retention. No `/cache warm now`, accelerated clock, or paid-request retry was used. The corrected run completed two automatic refreshes over **541.482 seconds** from foreground capture to the second refresh's completion.
+
+| Phase | Completed inference calls | Natural interval | Outcome | Estimated cost |
+| --- | ---: | ---: | --- | ---: |
+| Foreground, across both test runs | 4 | — | Completed, including resumed tool work | $0.024256 |
+| Automatic refresh 1 | 1 | 270.454 s | Cache hit | $0.000721 |
+| Automatic refresh 2 | 1 | 270.249 s | Cache hit | $0.000721 |
+| Total | 6 | — | Within the approved $0.245130 conservative bound | $0.025698 |
+
+Both refreshes transitioned from `warming` to the source-validated `warm` state and completed with priced ledger entries, proving positive cache reuse and accepted bounded output. Exact hidden cache-read/output token counts were not observable through the metadata-only observer. Counts come from completed foreground hooks/replies and the extension's successful warm ledger, not an independent HTTP wire counter; costs are native pricing estimates, not invoices.
+
+The session leaf, branch length, and assistant-message IDs stayed unchanged after each hidden refresh. The resumed foreground request reported **7,130 cache-read tokens**, executed one native file read successfully, and returned the fixture's verified checksum **509500**. Its tool continuation also completed normally. No auxiliary inference or retry event was observed; temporary title, recap, and automatic retry settings were disabled.
+
+The first test-only transport guard rejected a Request-form refresh before dispatch. That instrumentation failure was not a provider failure and incurred no warm charge; its completed initial foreground charge is included above. One explicitly approved restart removed that guard and retained all earlier cost evidence. No ambiguous paid request was replayed.
+
+The existing credential was resolved read-only and injected through isolated in-memory native authentication, never placed in files, arguments, environment variables, or observation output. Warming was disabled after the two cycles, the native CLI shut down gracefully, and all 37 task-owned temporary files plus the observer/watcher were removed. Original configuration and credentials were unchanged; no deployment was performed.
+
+This is a successful bounded natural soak for one provider/model/session, not an indefinite retention guarantee or a live verification of every adapter. Source SHA-256: `2cc9777a20abe5d894b113646acf99718344f9a5b56d3e502ec5fabb202c6eac`.
+
+### Observed: ordinary Codex subscription soak, 2026-10-11
+
+**Correction:** the earlier separately constructed model-discovery GET returned HTTP 401, but this did not establish that ordinary OMP inference was unavailable or that reauthentication was needed. Running OMP normally succeeded with its original native OAuth account routing and configured **`openai-codex/gpt-6-astra`**, without cloned credentials, a model-discovery gate, or API-key substitution.
+
+The real Windows native TUI on **OMP 18.8.7** ran the same verified source. A cold foreground request completed successfully but correctly did not authorize warming. A genuine follow-up reported **18,816 cache-read tokens**, enabling the generic **240-second unknown-TTL cadence**. This is not Sol's 25-minute policy and does not establish Astra's backend TTL.
+
+| Automatic refresh | Observed natural interval | Observed duration | Outcome | Native price estimate |
+| --- | ---: | ---: | --- | ---: |
+| 1 | 240.191 s | 2.680 s | Cache hit | $0.021114 |
+| 2 | 241.245 s | 3.496 s | Cache hit | $0.019962 |
+
+Both completed without `/cache warm now`, accelerated clocks, or retries. Timing comes from real-time native UI transitions, not independent wire timestamps. Source-validated `warming` → `warm` transitions establish positive usable cache reuse; exact hidden token counts were not observable. The leaf, branch length, and assistant-message IDs remained unchanged after each refresh.
+
+After warming was disabled, resumed work reported **18,944 cache-read tokens**, performed one native file read, and returned the verified checksum **509500**. Its tool continuation completed successfully with **19,072 cache-read tokens**. The run completed six inference calls: four foreground/tool requests and two automatic refreshes, with no observed auxiliary inference or failed reply.
+
+The native pricing estimate was **$0.300268 total**, including **$0.041076** for warming. These are SDK/catalog estimates, **not subscription charges or an invoice**. Actual subscription quota consumption and remaining limits were unavailable from this WebSocket run; no claim about their amounts is made.
+
+The successful run used ordinary native authentication without manual token extraction or selection. A task-owned configuration overlay left the configured model/authentication and original profile configuration intact. The TUI exited gracefully, and temporary workspace, observer, overlay, watcher, and ownership-verified orphan processes were removed. No source changes or deployment occurred.
+
+This supersedes the earlier blocked report and proves two natural subscription refreshes plus resumed real work on the configured Astra model. It does not prove indefinite retention or the separate Sol cadence. Source SHA-256: `2cc9777a20abe5d894b113646acf99718344f9a5b56d3e502ec5fabb202c6eac`.
 
 ### Published SDK 18.6.1: historical local verification
 

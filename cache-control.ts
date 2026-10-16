@@ -26,7 +26,6 @@ const BEDROCK_SUCCESS_STOP_REASONS: Record<string, true> = {
 	end_turn: true, stop_sequence: true, max_tokens: true, model_context_window_exceeded: true, tool_use: true,
 };
 
-// Settings > Appearance > Theme > Symbol Preset controls Unicode/Nerd Font/ASCII.
 // Requires the Custom layout's "status" segment; stock presets do not render it.
 // /cache [on|off] shows/hides it; off also suspends warming, on preserves warm setting.
 // /cache warm [on|off|now]: paid hidden refreshes retaining the captured cache prefix.
@@ -36,7 +35,7 @@ const BEDROCK_SUCCESS_STOP_REASONS: Record<string, true> = {
 // and budget-based thinking report unavailable, rather than rewriting the prefix.
 // ~ is an estimate, not a server TTL or eviction guarantee. Warm cost is separate.
 // Only reported cache reuse refreshes the estimate; misses retain the normal cadence.
-// A miss shows "warm miss" and unknown expiry; the next scheduled hit restores the estimate.
+// A miss hides the expiry estimate; the next scheduled hit restores it.
 // Static SDK imports use the host registry; the generated helpers retain pinned upstream replay and reader behavior.
 // Stateful Codex deltas expand only from the last verified foreground wire input
 // and native replayable output, committed by the awaited assistant_message hook.
@@ -65,15 +64,19 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	let timerContext: ExtensionContext | undefined;
 	let warmEnabled = true;
 	let foreground = false;
+	let captureTurn = false;
 	let shutdown = false;
 	let identity = "";
 	let revision = 0;
+	let cooldownUntil = 0;
+	let cooldownReason = "";
 	type CodexChain = { input: unknown[]; output: unknown[]; responseId: string };
 	let codexChain: CodexChain | undefined;
 	let snapshot: {
 		body: Record<string, unknown>; model: Pick<Model, "id" | "provider" | "api" | "requestModelId" | "promptCache" | "pricingStatus">;
 		sessionId: string; startedAt: number; ready: boolean; finalized: boolean; parent?: CodexChain;
 		delayMs: number; outputCap: number; ttlSeconds?: number; cacheName?: string; expiresAt?: number; residencyMs?: number;
+		paused?: string; retries: number;
 	} | undefined;
 	let foregroundAt: number | undefined;
 	let warmedAt: number | undefined;
@@ -112,24 +115,59 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	}
 
 	function stopWarming(ctx: ExtensionContext, reason: string): void {
-		warmEnabled = false;
+		if (snapshot) snapshot.paused = reason;
 		nextAt = undefined;
 		waiting = reason;
-		ctx.ui.notify(`Cache warming stopped: ${reason} /cache warm on reenables it.`, "warning");
+		ctx.ui.notify(`Cache warming paused: ${reason} A successful eligible real request or /cache warm on can resume it after cooldown.`, "warning");
+	}
+
+	function structuredStatus(value: unknown, depth = 0): number | undefined {
+		if (!value || typeof value !== "object" || depth > 3) return undefined;
+		const body = value as Record<string, unknown>;
+		for (const raw of [body.status, body.statusCode, body.status_code, body.errorStatus, body.code]) {
+			const status = typeof raw === "string" && /^[45]\d{2}$/.test(raw) ? Number(raw) : raw;
+			if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) return status;
+		}
+		return structuredStatus(body.error, depth + 1) ?? structuredStatus(body.response, depth + 1)
+			?? structuredStatus(body.status_details, depth + 1);
+	}
+
+	function setCooldown(status: number | undefined, retries: number, headers?: Headers): void {
+		if (status !== 429 && status !== 402) return;
+		const now = Date.now();
+		let deadline = now + (status === 402 ? 5 * 60_000 : 60_000 * 2 ** Math.min(retries, 2));
+		const retryAfter = headers?.get("retry-after")?.trim();
+		if (retryAfter) {
+			const delta = /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(retryAfter) ? Number(retryAfter) : undefined;
+			const until = delta !== undefined ? now + delta * 1000
+				: /^[A-Za-z]/.test(retryAfter) ? Date.parse(retryAfter) : Number.NaN;
+			if (Number.isFinite(until)) deadline = Math.max(deadline, until);
+		}
+		const retryMs = headers?.get("retry-after-ms")?.trim();
+		if (retryMs && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(retryMs)) {
+			const until = now + Number(retryMs);
+			if (Number.isFinite(until)) deadline = Math.max(deadline, until);
+		}
+		cooldownUntil = Math.max(cooldownUntil, deadline);
+		cooldownReason = status === 429 ? "The provider rate-limited the refresh (HTTP 429)."
+			: "The provider rejected paid maintenance (HTTP 402); no automatic paid retry will be sent.";
 	}
 
 	function warmStatus(): string {
+		const cooling = Date.now() < cooldownUntil;
 		let state = active && !active.cancelled ? "running" : !enabled || !warmEnabled || shutdown ? "off"
-			: waiting.startsWith("Unavailable:") ? "unavailable" : "pending";
+			: cooling ? `${snapshot?.paused ? "paused; " : snapshot?.retries ? "retry " : ""}cooldown ${duration(Math.ceil((cooldownUntil - Date.now()) / 1000))}`
+				: snapshot?.paused ? "paused" : waiting.startsWith("Unavailable:") ? "unavailable" : "pending";
 		if (state === "pending" && nextAt !== undefined && snapshot?.ready) {
 			state = `${warmMiss ? "miss; " : ""}next in ${duration(Math.max(0, Math.ceil((nextAt - Date.now()) / 1000)))}`;
 		}
-		const note = warmMiss || state === "pending" || state === "off" || state === "unavailable" ? waiting
-			: snapshot?.ttlSeconds === undefined
-				? snapshot?.residencyMs !== undefined
-					? `Paid ${duration(Math.ceil(snapshot.delayMs / 1000))} maintenance respects native residency; KV TTL remains unknown.`
-					: "Paid 4-minute maintenance interval is inferred; TTL remains unknown."
-				: "Paid idle-only prefix refreshes; /cache warm off stops them.";
+		const note = state === "off" ? waiting : snapshot?.paused ?? (cooling ? cooldownReason : undefined)
+			?? (warmMiss || state === "pending" || state === "unavailable" ? waiting
+				: snapshot?.ttlSeconds === undefined
+					? snapshot?.residencyMs !== undefined
+						? `Paid ${duration(Math.ceil(snapshot.delayMs / 1000))} maintenance respects native residency; KV TTL remains unknown.`
+						: "Paid 4-minute maintenance interval is inferred; TTL remains unknown."
+					: "Paid idle-only prefix refreshes; /cache warm off stops them.");
 		const storage = snapshot?.cacheName || storageCalls ? " Explicit-cache storage extension is billed; its price is unavailable." : "";
 		return `Cache warm ${state}; ${calls} calls; estimated inference warm cost $${cost.toFixed(6)}${unpriced ? ` (${unpriced} unpriced)` : ""}, separate from native footer. ${note}${storage}`;
 	}
@@ -137,14 +175,24 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	async function warm(ctx: ExtensionContext, force = false): Promise<void> {
 		syncIdentity(ctx);
 		const captured = snapshot;
-		if (!enabled || !warmEnabled || shutdown || ctx.mode !== "tui" || !ctx.hasUI || active
-			|| !captured?.ready || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (!enabled || !warmEnabled || shutdown || foreground || ctx.mode !== "tui" || !ctx.hasUI || active
+			|| !captured?.ready || captured.paused || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) return;
 		const key = identity;
 		const version = revision;
 		const job = { controller: new AbortController(), cancelled: false };
 		active = job;
 		let sentAt: number | undefined;
 		let failure = "No verified cache refresh response was received.";
+		let rejected429 = false;
+		const rejectResponse = async (response: Response, definitive = true): Promise<void> => {
+			if (response.ok) return;
+			rejected429 = definitive && response.status === 429;
+			setCooldown(response.status, captured.retries, response.headers);
+			failure = `The provider rejected the refresh (HTTP ${response.status}); prompt diagnostics were suppressed.`;
+			job.controller.abort();
+			try { await response.body?.cancel(); } catch { }
+			throw new Error("Warm transport rejected");
+		};
 		const states = new Map<string, ProviderSessionState>();
 		const timeout = ctx.setTimeout(() => {
 			failure = "The 45-second refresh timeout elapsed.";
@@ -157,7 +205,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 		});
 		const isCurrent = () => active === job && !job.cancelled && !job.controller.signal.aborted
 			&& version === revision && identity === key && currentIdentity(ctx) === key
-			&& snapshot === captured && enabled && warmEnabled && !shutdown;
+			&& snapshot === captured && enabled && warmEnabled && !shutdown && !foreground;
 		try {
 			monitor(ctx);
 			const result = await Promise.race([aborted, (async () => {
@@ -173,7 +221,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 					throw new Error("Warm model no longer current");
 				}
 				const apiKey = await ctx.modelRegistry.getApiKey(model, captured.sessionId, { signal: job.controller.signal });
-				if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+				if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 					job.cancelled = true;
 					throw new Error("Warm request no longer current");
 				}
@@ -183,7 +231,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 					throw new Error("Missing model auth");
 				}
 				let headers = model.resolveHeaders ? await model.resolveHeaders(job.controller.signal) : model.headers;
-				if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+				if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 					job.cancelled = true;
 					throw new Error("Warm headers no longer current");
 				}
@@ -204,15 +252,15 @@ export default function cacheControl(pi: ExtensionAPI): void {
 						url = `${base.replace(/\/$/, "")}/${captured.cacheName}`;
 						headers = { ...headers, "x-goog-api-key": apiKey! };
 					}
-					if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+					if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 						job.cancelled = true;
 						throw new Error("Cache metadata request no longer current");
 					}
 					failure = "Explicit-cache metadata could not be verified.";
 					const response = await fetch(url, { headers, signal: job.controller.signal });
-					if (!response.ok) throw new Error("Cache metadata failed");
+					await rejectResponse(response);
 					const lease = await response.json() as { name?: unknown; model?: unknown; expireTime?: unknown; updateTime?: unknown; createTime?: unknown };
-					if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+					if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 						job.cancelled = true;
 						throw new Error("Cache extension no longer current");
 					}
@@ -237,7 +285,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 						method: "PATCH", headers: { ...headers, "Content-Type": "application/json" },
 						body: JSON.stringify({ ttl: `${retentionMs / 1000}s` }), signal: job.controller.signal,
 					});
-					if (!renewal.ok) throw new Error("Cache renewal failed");
+					await rejectResponse(renewal);
 					const changed = await renewal.json() as { name?: unknown; expireTime?: unknown };
 					const expiry = typeof changed.expireTime === "string" ? Date.parse(changed.expireTime) : Number.NaN;
 					if (changed.name !== captured.cacheName || !Number.isFinite(expiry) || expiry <= Date.now() || expiry <= expiresAt) {
@@ -252,8 +300,27 @@ export default function cacheControl(pi: ExtensionAPI): void {
 				const bedrock = captured.model.api === "bedrock-converse-stream";
 				let inferenceDispatched = false;
 				let warmFrame: Record<string, unknown> | undefined;
+				// Anthropic betas follow request options, not the body; the empty warm
+				// context would drop them and the replayed fields would 400.
+				type Block = { type?: unknown; signature?: unknown };
+				// Shape-only reads of our own captured payload; absent fields mean no beta.
+				const body = captured.body as {
+					context_management?: { edits?: Block[] }; compaction?: unknown; speed?: unknown;
+					output_config?: { effort?: unknown; task_budget?: unknown }; messages?: { content?: unknown }[];
+				};
+				const edits = body.context_management?.edits ?? [];
+				const betas = captured.model.api !== "anthropic-messages" ? undefined : [
+					edits.some(edit => edit.type !== "compact_20260112") && "context-management-2025-06-27",
+					edits.some(edit => edit.type === "compact_20260112") && "compact-2026-01-12",
+					(body.compaction !== undefined || (body.messages ?? []).some(message => Array.isArray(message.content)
+						&& (message.content as Block[]).some(block => block.type === "compaction" && block.signature !== undefined)))
+					&& "compact-2026-09-04",
+					body.output_config?.effort !== undefined && "effort-2025-11-24",
+					body.output_config?.task_budget !== undefined && "task-budgets-2026-03-13",
+					body.speed === "fast" && "fast-mode-2026-02-01",
+				].filter((beta): beta is string => !!beta);
 				const events = ai.stream(codex ? { ...model, preferWebsockets: true } : model, { messages: [] }, {
-					apiKey, sessionId: captured.sessionId, providerSessionState: states,
+					apiKey, sessionId: captured.sessionId, providerSessionState: states, betas,
 					// Keep SDK envelope construction valid; the hook applies the actual wire cap.
 					maxTokens: captured.outputCap || 1, preferWebsockets: codex, statefulResponses: false, acceptEmptyResponse: true,
 					codexSseMaxAttempts: 1, streamFirstEventTimeoutMs: 45_000, streamIdleTimeoutMs: 45_000,
@@ -272,7 +339,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 								job.controller.abort();
 								throw new Error("Warm retry refused");
 							}
-							if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+							if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 								job.cancelled = true;
 								job.controller.abort();
 								throw new Error("Warm request no longer current");
@@ -280,24 +347,19 @@ export default function cacheControl(pi: ExtensionAPI): void {
 							inferenceDispatched = true;
 						}
 						const response = await fetch(input, init);
-						if (inference && (response.status === 400 || response.status === 413)) {
-							// Hide paid-refresh prompts from native rejected-request disk diagnostics.
-							// Abort retries before the SDK can turn this response into a status-bearing error.
-							failure = "The provider rejected the refresh; prompt diagnostics were suppressed.";
-							job.controller.abort();
-							throw new Error("Warm transport rejected");
-						}
-						if (!inference || captured.model.api === "ollama-chat" || !response.ok || !response.body) return response;
+						// Reject before native retry/error handling can persist a private prompt.
+						if (inference || response.status === 429 || response.status === 402) await rejectResponse(response, inference);
+						if (!inference || captured.model.api === "ollama-chat" || !response.body) return response;
 						// Reader cleanup is not a failed warm job. Its own signal also settles a
 						// pending native iterator read before return() releases the HTTP reader.
 						const transport = new AbortController();
 						const signal = AbortSignal.any([job.controller.signal, transport.signal,
-							init?.signal ?? (input instanceof Request ? input.signal : job.controller.signal)]);
+						init?.signal ?? (input instanceof Request ? input.signal : job.controller.signal)]);
 						const encoder = new TextEncoder();
 						const decoder = bedrock ? new TextDecoder() : undefined;
 						const codec = decoder ? new EventStreamCodec(bytes => decoder.decode(bytes), text => encoder.encode(text)) : undefined;
 						const chunks = bedrock ? abortableSource(response.body, signal) : undefined;
-						const frames = chunks ? (async function* () {
+						const frames = chunks ? (async function*() {
 							try {
 								yield* getChunkedStream(chunks);
 							} finally {
@@ -315,7 +377,10 @@ export default function cacheControl(pi: ExtensionAPI): void {
 										const raw = frame.value as Uint8Array;
 										const message = codec.decode(raw);
 										const type = message.headers[":message-type"]?.value;
-										if (type === "exception" || type === "error") throw new Error("Warm stream rejected");
+										if (type === "exception" || type === "error") {
+											try { setCooldown(structuredStatus(JSON.parse(decoder.decode(message.body))), captured.retries); } catch { }
+											throw new Error("Warm stream rejected");
+										}
 										if (type === "event" && message.headers[":event-type"]?.value === "messageStop") {
 											const payload = JSON.parse(decoder.decode(message.body)) as { stopReason?: unknown } | null;
 											if (BEDROCK_SUCCESS_STOP_REASONS[String(payload?.stopReason)] !== true) {
@@ -342,6 +407,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 									const candidate = candidates?.[0];
 									const choice = Array.isArray(value?.choices) ? value.choices[0] as Record<string, unknown> | undefined : undefined;
 									const delta = value?.delta as Record<string, unknown> | undefined;
+									// Text-derived status is privacy-only; cooldown requires a structured code.
 									const status = errors.status(value);
 									if (malformed || event.event === "error" || event.event === "response.failed"
 										|| value?.type === "error" || value?.type === "response.failed"
@@ -360,6 +426,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 											&& (delta?.stop_reason === "refusal" || delta?.stop_reason === "sensitive"))) {
 										// Even statusless provider messages can trigger native rejected-request
 										// dumps. Reject failure frames before any private detail reaches the SDK.
+										setCooldown(structuredStatus(value), captured.retries);
 										failure = "The provider rejected the refresh; prompt diagnostics were suppressed.";
 										controller.error(new Error("Warm stream rejected"));
 										job.controller.abort();
@@ -396,6 +463,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 						} else if (event.event === "error" || event.event === "response.failed") {
 							// The raw observer runs before native error parsing/queueing.
 							// Abort there, not after AIError.finalize has persisted diagnostics.
+							try { setCooldown(structuredStatus(JSON.parse(event.data)), captured.retries); } catch { }
 							failure = "The provider rejected the refresh; prompt diagnostics were suppressed.";
 							job.controller.abort();
 						}
@@ -410,7 +478,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 							failure = "The provider attempted a retry; automatic warm retries are disabled.";
 							throw new Error("Warm retry refused");
 						}
-						if (!isCurrent() || !ctx.isIdle() || ctx.hasPendingMessages()) {
+						if (!isCurrent() || Date.now() < cooldownUntil || !ctx.isIdle() || ctx.hasPendingMessages()) {
 							job.cancelled = true;
 							throw new Error("Warm request no longer current");
 						}
@@ -458,8 +526,10 @@ export default function cacheControl(pi: ExtensionAPI): void {
 						} else {
 							const nativeConfig = payload && typeof payload === "object" && "config" in payload && payload.config && typeof payload.config === "object"
 								? payload.config as Record<string, unknown> : undefined;
-							body.config = { ...(body.config as Record<string, unknown>), maxOutputTokens: captured.outputCap,
-								abortSignal: job.controller.signal, ...(nativeConfig?.httpOptions ? { httpOptions: nativeConfig.httpOptions } : {}) };
+							body.config = {
+								...(body.config as Record<string, unknown>), maxOutputTokens: captured.outputCap,
+								abortSignal: job.controller.signal, ...(nativeConfig?.httpOptions ? { httpOptions: nativeConfig.httpOptions } : {})
+							};
 						}
 						sentAt = Date.now();
 						calls++;
@@ -478,7 +548,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 					} else if (event.type.startsWith("toolcall") || event.type === "image_end"
 						|| (codex ? event.partial.content.reduce((n, block) => n + (block.type === "text" ? block.text.length : 0), 0) > 64
 							: event.partial.usage.output > captured.outputCap)) {
-						failure = "The provider emitted forbidden output; warming is disabled.";
+						failure = "The provider emitted forbidden output; this snapshot is paused.";
 						job.controller.abort();
 						throw new Error("Warm output refused");
 					}
@@ -489,7 +559,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 				if (!isCurrent()) return;
 				captured.expiresAt = result.cacheExpiry;
 				captured.ttlSeconds = result.retentionMs / 1000;
-				nextAt = result.cacheExpiry - Math.max(10_000, Math.floor(result.retentionMs * 0.1));
+				nextAt = Math.max(cooldownUntil, Date.now() + 1000, result.cacheExpiry - Math.max(10_000, Math.floor(result.retentionMs * 0.1)));
 				waiting = "Explicit-cache storage renewal is enabled.";
 				return;
 			}
@@ -514,7 +584,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 				throw new Error("Unverified warm response");
 			}
 			warmMiss = usage.cacheRead <= 0;
-			nextAt = Math.max(foregroundAt ?? 0, sentAt) + captured.delayMs;
+			nextAt = Math.max(cooldownUntil, Date.now() + 1000, Math.max(foregroundAt ?? 0, sentAt) + captured.delayMs);
 			if (warmMiss) {
 				waiting = "Warm miss: the response reported no cache reuse; expiry was not refreshed and TTL remains unknown.";
 				return;
@@ -522,15 +592,23 @@ export default function cacheControl(pi: ExtensionAPI): void {
 			warmedAt = sentAt;
 			waiting = "Paid refreshes are enabled.";
 		} catch {
-			if (!job.cancelled && version === revision && identity === key && currentIdentity(ctx) === key && !shutdown) {
-				stopWarming(ctx, failure);
+			if (!job.cancelled && version === revision && identity === key && currentIdentity(ctx) === key
+				&& snapshot === captured && !shutdown) {
+				if (rejected429 && captured.retries < 3) {
+					captured.retries++;
+					nextAt = cooldownUntil;
+					waiting = `${cooldownReason} Scheduled retry ${captured.retries}/3 will wait for cooldown and an idle session.`;
+					ctx.ui.notify(`Cache warming retry cooldown: ${waiting}`, "warning");
+				} else {
+					stopWarming(ctx, rejected429 ? `${failure} The three scheduled retries for this snapshot are exhausted.` : failure);
+				}
 			}
 		} finally {
 			ctx.clearTimer(timeout);
 			if (abortListener) job.controller.signal.removeEventListener("abort", abortListener);
 			for (const state of states.values()) {
 				try { state.close(); } catch {
-					if (!job.cancelled && version === revision && currentIdentity(ctx) === key && !shutdown) {
+					if (!job.cancelled && version === revision && currentIdentity(ctx) === key && snapshot === captured && !shutdown) {
 						stopWarming(ctx, "Provider transport cleanup failed.");
 					}
 				}
@@ -566,25 +644,17 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	function monitor(ctx: ExtensionContext): void {
 		syncIdentity(ctx);
 		if (!ctx.hasUI || !enabled) return;
-		const theme = ctx.ui.theme;
-		const label = theme.symbol("icon.cache");
 		const model = ctx.models.current();
-		const indicator = model ? `${theme.symbol("sep.dot")}${active && !active.cancelled ? "warming"
-			: !warmEnabled ? "warm off" : waiting.startsWith("Unavailable:") ? "warm unavailable"
-			: warmMiss ? "warm miss" : snapshot?.cacheName && snapshot.expiresAt !== undefined ? "lease"
-			: snapshot?.ready && warmedAt !== undefined ? "warm" : "warm pending"}` : "";
 		if (!latest || (model && (latest.provider !== model.provider || latest.model !== model.id))) {
-			const empty = theme.getSymbolPreset() === "ascii" ? "-" : "—";
-			ctx.ui.setStatus("prompt-cache", (latest ? `${label} pending` : `${label} ${empty}`) + indicator);
+			ctx.ui.setStatus("prompt-cache", undefined);
 			return;
 		}
 		const usage = latest.usage;
 		const total = usage.input + usage.cacheRead + usage.cacheWrite;
 		if (total <= 0) {
-			ctx.ui.setStatus("prompt-cache", `${label} ${theme.getSymbolPreset() === "ascii" ? "-" : "—"}${indicator}`);
+			ctx.ui.setStatus("prompt-cache", undefined);
 			return;
 		}
-		const reuse = `${Math.round((usage.cacheRead / total) * 100)}%`;
 		const anchor = Number.isFinite(latest.timestamp)
 			? Math.max(latest.timestamp, foregroundAt ?? 0, warmedAt ?? 0) : latest.timestamp;
 		const age = Number.isFinite(anchor) ? Math.max(0, Math.floor((Date.now() - anchor) / 1000)) : undefined;
@@ -597,24 +667,24 @@ export default function cacheControl(pi: ExtensionAPI): void {
 			: warmedAt !== undefined ? snapshot?.ttlSeconds : undefined;
 		const usable = latest.stopReason !== "error" && latest.stopReason !== "aborted";
 		const assumeSol = usable && total >= 1024 && !long && !short && model?.provider === "openai-codex" && model.id === "gpt-6.1-sol";
-		let expiry = "ttl ?";
-		if (warmMiss) {
-			expiry = "ttl ?";
-		} else if (usable && snapshot?.cacheName && snapshot.expiresAt !== undefined) {
-			const remaining = Math.ceil((snapshot.expiresAt - Date.now()) / 1000);
-			expiry = remaining > 0 ? `~${duration(remaining)}` : "~expired";
-		} else if (usable && age !== undefined && ttl !== undefined && Number.isFinite(ttl) && ttl > 0) {
-			const remaining = Math.ceil(ttl - age);
-			expiry = remaining > 0 ? `~${duration(remaining)}` : "~expired";
-		} else if (assumeSol && age !== undefined) {
-			const remaining = 30 * 60 - age;
-			expiry = remaining > 0 ? `~${duration(remaining)}` : "~expired";
+		let expiry: string | undefined;
+		if (!warmMiss && usable) {
+			if (snapshot?.cacheName && snapshot.expiresAt !== undefined) {
+				const remaining = Math.ceil((snapshot.expiresAt - Date.now()) / 1000);
+				if (remaining > 0) expiry = `~${duration(remaining)}`;
+			} else if (age !== undefined && ttl !== undefined && Number.isFinite(ttl) && ttl > 0) {
+				const remaining = Math.ceil(ttl - age);
+				if (remaining > 0) expiry = `~${duration(remaining)}`;
+			} else if (assumeSol && age !== undefined) {
+				const remaining = 30 * 60 - age;
+				if (remaining > 0) expiry = `~${duration(remaining)}`;
+			}
 		}
-		ctx.ui.setStatus("prompt-cache", `${label} ${reuse}${theme.symbol("sep.dot")}${expiry}${indicator}`);
+		ctx.ui.setStatus("prompt-cache", expiry);
 	}
 
 	function startTimer(ctx: ExtensionContext): void {
-		if (!ctx.hasUI || !enabled || timer !== undefined) return;
+		if (!ctx.hasUI || !enabled || shutdown || timer !== undefined) return;
 		timerContext = ctx;
 		// Reuse the native managed UI timer: no second polling loop or startup turn.
 		timer = ctx.setInterval(() => {
@@ -627,7 +697,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) return;
 		ctx.ui.setWidget("cache-control", undefined);
 		ctx.ui.setWidget("cache-monitor", undefined);
-		if (enabled) monitor(ctx);
+		if (enabled && !shutdown) monitor(ctx);
 		else ctx.ui.setStatus("prompt-cache", undefined);
 	}
 
@@ -635,6 +705,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 		stopTimer();
 		cancelWarm();
 		foreground = false;
+		captureTurn = false;
 		identity = currentIdentity(ctx);
 		snapshot = undefined;
 		codexChain = undefined;
@@ -651,6 +722,20 @@ export default function cacheControl(pi: ExtensionAPI): void {
 
 	pi.registerCommand("cache", {
 		description: "Custom cache status [on|off] (on preserves warm setting); warm [on|off|now] paid hidden prefix refreshes (~ estimated)",
+		getArgumentCompletions: argumentPrefix => {
+			const prefix = argumentPrefix.trimStart().replace(/\s+/g, " ");
+			const items = prefix.startsWith("warm ") ? [
+				{ value: "warm on", label: "on", description: "Enable paid hidden prefix refreshes" },
+				{ value: "warm off", label: "off", description: "Disable paid prefix refreshes" },
+				{ value: "warm now", label: "now", description: "Run a paid hidden prefix refresh now" },
+			] : [
+				{ value: "on", label: "on", description: "Show cache status; preserve warm setting" },
+				{ value: "off", label: "off", description: "Hide cache status and suspend warming" },
+				{ value: "warm", label: "warm", description: "Inspect or manage paid prefix refreshes" },
+			];
+			const matches = items.filter(item => item.value.startsWith(prefix));
+			return matches.length ? matches : null;
+		},
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) return;
 			const action = args.trim().replace(/\s+/g, " ");
@@ -670,14 +755,15 @@ export default function cacheControl(pi: ExtensionAPI): void {
 					waiting = "Disabled manually; /cache warm on reenables paid refreshes.";
 				} else if (action === "warm on") {
 					warmEnabled = true;
-					if (snapshot?.ready) {
+					if (snapshot?.ready && Date.now() >= cooldownUntil) {
+						snapshot.paused = undefined;
 						waiting = "Paid refreshes are enabled.";
-						nextAt = snapshot.cacheName ? snapshot.expiresAt === undefined ? Date.now()
+						nextAt ??= snapshot.cacheName ? snapshot.expiresAt === undefined ? Date.now()
 							: snapshot.expiresAt - Math.max(10_000, Math.floor((snapshot.ttlSeconds ?? 0) * 100))
 							: Math.max(foregroundAt ?? snapshot.startedAt, warmedAt ?? 0) + snapshot.delayMs;
 					}
 				} else if (action === "warm now") {
-					if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+					if (foreground || !ctx.isIdle() || ctx.hasPendingMessages()) {
 						ctx.ui.notify("Cache warm pending: wait until the agent is idle and queued messages finish.", "info");
 						return;
 					}
@@ -711,11 +797,11 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (_event, ctx) => {
 		shutdown = true;
 		foreground = false;
+		captureTurn = false;
 		cancelWarm();
 		snapshot = undefined;
 		codexChain = undefined;
 		foregroundAt = warmedAt = nextAt = undefined;
-		enabled = false;
 		latest = undefined;
 		stopTimer();
 		refresh(ctx);
@@ -724,6 +810,16 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (_event, ctx) => {
 		cancelWarm();
 		foreground = true;
+		captureTurn = true;
+		snapshot = undefined;
+		nextAt = undefined;
+		if (warmEnabled) waiting = "Waiting for the next successful real request with a cacheable prefix.";
+		refresh(ctx);
+	});
+	pi.on("turn_start", (_event, ctx) => {
+		if (!foreground || shutdown) return;
+		cancelWarm();
+		captureTurn = true;
 		snapshot = undefined;
 		nextAt = undefined;
 		if (warmEnabled) waiting = "Waiting for the next successful real request with a cacheable prefix.";
@@ -731,8 +827,21 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	});
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!foreground || shutdown || ctx.mode !== "tui" || !ctx.hasUI) return;
-		cancelWarm();
 		syncIdentity(ctx);
+		if (snapshot && !snapshot.finalized && !Bun.deepEquals(snapshot.body, event.payload)) {
+			cancelWarm();
+			captureTurn = false;
+			snapshot = undefined;
+			codexChain = undefined;
+			nextAt = undefined;
+			waiting = "Unavailable: this turn has multiple distinct payloads without verified foreground ownership; wait for the next real turn.";
+			refresh(ctx);
+			return;
+		}
+		if (!captureTurn) return;
+		cancelWarm();
+		const startedAt = snapshot?.startedAt ?? Date.now();
+		captureTurn = false;
 		snapshot = undefined;
 		nextAt = undefined;
 		warmedAt = undefined;
@@ -782,16 +891,23 @@ export default function cacheControl(pi: ExtensionAPI): void {
 		// hooks replacing the entire body are not observable through this public hook.
 		const outputCap = model.api === "openai-codex-responses" || model.api === "openai-responses" || model.api === "azure-openai-responses"
 			|| (model.api === "openai-completions" && (model.reasoning || (payload.reasoning_effort !== undefined && payload.reasoning_effort !== "none"))) ? 16 : 1;
-		snapshot = { body: payload,
-			model: { id: model.id, provider: model.provider, api: model.api, requestModelId: model.requestModelId,
-				promptCache: model.promptCache ? { ...model.promptCache } : undefined, pricingStatus: model.pricingStatus },
-			sessionId: ctx.sessionManager.getSessionId(), startedAt: Date.now(), ready: false, finalized: false, parent,
-			delayMs: 4 * 60_000, outputCap };
+		snapshot = {
+			body: payload,
+			model: {
+				id: model.id, provider: model.provider, api: model.api, requestModelId: model.requestModelId,
+				promptCache: model.promptCache ? { ...model.promptCache } : undefined, pricingStatus: model.pricingStatus
+			},
+			sessionId: ctx.sessionManager.getSessionId(), startedAt, ready: false, finalized: false, parent,
+			delayMs: 4 * 60_000, outputCap, retries: 0
+		};
+		captureTurn = true;
 	});
 	// This awaited native hook settles the originating stream BEFORE the next
 	// provider request/tool continuation. Notification delivery is not ownership.
 	pi.on("assistant_message", (event, ctx) => {
 		if (!ctx.hasUI) return;
+		// Native title/side turns share onPayload but have no foreground turn_start.
+		captureTurn = false;
 		syncIdentity(ctx);
 		const captured = snapshot;
 		if (captured && !captured.finalized && event.message.provider === captured.model.provider && event.message.model === captured.model.id
@@ -1005,7 +1121,7 @@ export default function cacheControl(pi: ExtensionAPI): void {
 					warmMiss = false;
 					// Fixed explicit-cache expiry is queried while idle; foreground reads
 					// must never postpone its deadline or pretend to renew it.
-					nextAt = captured.cacheName ? Date.now() : Math.max(foregroundAt, warmedAt ?? 0) + captured.delayMs;
+					nextAt = Math.max(cooldownUntil, captured.cacheName ? Date.now() : Math.max(foregroundAt, warmedAt ?? 0) + captured.delayMs);
 					if (warmEnabled) waiting = "Paid refreshes are enabled.";
 				}
 			} else {
@@ -1027,12 +1143,14 @@ export default function cacheControl(pi: ExtensionAPI): void {
 	pi.on("cache_warming_decision", (_event, ctx) => ctx.hasUI && ctx.mode === "tui" ? { action: "stop" } : undefined);
 	// message_end notification can precede persistence. Re-read native history at settle.
 	pi.on("turn_end", (_event, ctx) => {
+		captureTurn = false;
 		if (!ctx.hasUI) return;
 		seed(ctx);
 		refresh(ctx);
 	});
 	pi.on("agent_end", (_event, ctx) => {
 		foreground = false;
+		captureTurn = false;
 		if (snapshot?.model.api === "openai-codex-responses" && !snapshot.finalized) {
 			codexChain = undefined;
 			snapshot = undefined;
